@@ -3,8 +3,11 @@
 const fastify = require('fastify')({ logger: true });
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 
-// Base de données
+// Base de donnees
 const db = new Pool({
   host: process.env.DB_HOST || 'kaniene_postgres',
   port: 5432,
@@ -13,10 +16,23 @@ const db = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
+// ─── UPLOAD DIR ─────────────────────────────────────────
+const UPLOAD_DIR = '/app/uploads/products';
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
 // Plugins
 fastify.register(require('@fastify/cors'), { origin: true });
 fastify.register(require('@fastify/jwt'), {
   secret: process.env.JWT_SECRET || 'utiam_secret_key'
+});
+fastify.register(require('@fastify/multipart'), {
+  limits: { fileSize: 10 * 1024 * 1024 }  // 10 MB max
+});
+fastify.register(require('@fastify/static'), {
+  root: UPLOAD_DIR,
+  prefix: '/uploads/products/',
 });
 
 // Middleware auth
@@ -24,7 +40,7 @@ fastify.decorate('authenticate', async function(request, reply) {
   try {
     await request.jwtVerify();
   } catch (err) {
-    reply.status(401).send({ error: 'Non autorisé' });
+    reply.status(401).send({ error: 'Non autorise' });
   }
 });
 
@@ -90,7 +106,6 @@ fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (reque
 });
 
 fastify.post('/api/products', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-  // [IMAGE-PRODUIT] image_url ajouté — nullable, rétrocompatible
   const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url } = request.body;
   const result = await db.query(
     'INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
@@ -100,7 +115,6 @@ fastify.post('/api/products', { onRequest: [fastify.authenticate] }, async (requ
 });
 
 fastify.put('/api/products/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-  // [IMAGE-PRODUIT] image_url ajouté — nullable, rétrocompatible
   const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url } = request.body;
   const result = await db.query(
     'UPDATE utiam_products SET name=$1, barcode=$2, buy_price=$3, sell_price=$4, category_id=$5, brand=$6, unit=$7, stock=$8, min_stock=$9, expiry_date=$10, image_url=$11, updated_at=NOW() WHERE id=$12 RETURNING *',
@@ -111,6 +125,121 @@ fastify.put('/api/products/:id', { onRequest: [fastify.authenticate] }, async (r
 
 fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   await db.query('DELETE FROM utiam_products WHERE id = $1', [request.params.id]);
+  return reply.status(204).send();
+});
+
+
+// ─── IMAGES PRODUITS ──────────────────────────────────────
+// Lister les images d'un produit
+fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request) => {
+  const result = await db.query(
+    'SELECT * FROM utiam_product_images WHERE product_id = $1 ORDER BY is_primary DESC, position ASC, id ASC',
+    [request.params.id]
+  );
+  return result.rows;
+});
+
+// Uploader une image
+fastify.post('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const productId = request.params.id;
+
+  // Verifier que le produit existe
+  const prodCheck = await db.query('SELECT id FROM utiam_products WHERE id = $1', [productId]);
+  if (prodCheck.rows.length === 0) {
+    return reply.status(404).send({ error: 'Produit introuvable' });
+  }
+
+  // Recuperer le fichier uploade
+  const data = await request.file();
+  if (!data) {
+    return reply.status(400).send({ error: 'Aucun fichier fourni' });
+  }
+
+  // Verifier le type MIME
+  if (!data.mimetype.startsWith('image/')) {
+    return reply.status(400).send({ error: 'Le fichier doit etre une image' });
+  }
+
+  // Charger sharp uniquement quand on en a besoin
+  const sharp = require('sharp');
+
+  // Generer un nom unique
+  const ext = '.webp';  // toujours en webp pour la compression
+  const filename = `${productId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+  const filepath = path.join(UPLOAD_DIR, filename);
+
+  // Compresser et redimensionner avec sharp (max 1200px, qualite 80%)
+  const buffer = await data.toBuffer();
+  await sharp(buffer)
+    .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
+    .webp({ quality: 80 })
+    .toFile(filepath);
+
+  // URL publique
+  const url = `/uploads/products/${filename}`;
+
+  // Verifier si c'est la premiere image (alors elle devient principale)
+  const existing = await db.query(
+    'SELECT COUNT(*) as cnt FROM utiam_product_images WHERE product_id = $1',
+    [productId]
+  );
+  const isPrimary = parseInt(existing.rows[0].cnt) === 0;
+
+  // Enregistrer en BDD
+  const result = await db.query(
+    'INSERT INTO utiam_product_images (product_id, filename, url, is_primary, position) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    [productId, filename, url, isPrimary, parseInt(existing.rows[0].cnt)]
+  );
+
+  return reply.status(201).send(result.rows[0]);
+});
+
+// Definir une image comme principale
+fastify.put('/api/products/:id/images/:imageId/primary', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id, imageId } = request.params;
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE utiam_product_images SET is_primary = FALSE WHERE product_id = $1', [id]);
+    await client.query('UPDATE utiam_product_images SET is_primary = TRUE WHERE id = $1 AND product_id = $2', [imageId, id]);
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// Supprimer une image
+fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const imageId = request.params.imageId;
+
+  // Recuperer les infos de l'image
+  const imgResult = await db.query('SELECT * FROM utiam_product_images WHERE id = $1', [imageId]);
+  if (imgResult.rows.length === 0) {
+    return reply.status(404).send({ error: 'Image introuvable' });
+  }
+  const img = imgResult.rows[0];
+
+  // Supprimer le fichier physique
+  const filepath = path.join(UPLOAD_DIR, img.filename);
+  if (fs.existsSync(filepath)) {
+    fs.unlinkSync(filepath);
+  }
+
+  // Supprimer en BDD
+  await db.query('DELETE FROM utiam_product_images WHERE id = $1', [imageId]);
+
+  // Si c'etait l'image principale, en designer une autre comme principale
+  if (img.is_primary) {
+    await db.query(
+      'UPDATE utiam_product_images SET is_primary = TRUE WHERE id = (SELECT id FROM utiam_product_images WHERE product_id = $1 ORDER BY position ASC LIMIT 1)',
+      [img.product_id]
+    );
+  }
+
   return reply.status(204).send();
 });
 
@@ -241,7 +370,7 @@ fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async
   };
 });
 
-// ─── UTILISATEURS ────────────────────────────────────────
+// ─── UTILISATEURS ─────────────────────────────────────────
 fastify.get('/api/users', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query(
     'SELECT id, email, display_name, role, is_active, created_at FROM utiam_users ORDER BY created_at DESC'
@@ -259,11 +388,11 @@ fastify.post('/api/users', { onRequest: [fastify.authenticate] }, async (request
   return reply.status(201).send(result.rows[0]);
 });
 
-// ─── DÉMARRAGE ────────────────────────────────────────────
+// ─── DEMARRAGE ────────────────────────────────────────────
 const start = async () => {
   try {
     await fastify.listen({ port: 3002, host: '0.0.0.0' });
-    console.log('U TIAM backend démarré sur le port 3002');
+    console.log('U TIAM backend demarre sur le port 3002');
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
