@@ -88,6 +88,8 @@ fastify.post('/api/categories', { onRequest: [fastify.authenticate] }, async (re
 });
 
 // ─── PRODUITS ─────────────────────────────────────────────
+// La requete principale joint la table utiam_product_images pour recuperer
+// l'image principale (is_primary = true) et la mettre dans le champ primary_image_url
 fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (request) => {
   const { search, barcode } = request.query;
   if (barcode) {
@@ -101,7 +103,15 @@ fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (reque
     );
     return result.rows;
   }
-  const result = await db.query('SELECT p.*, c.name as category_name FROM utiam_products p LEFT JOIN utiam_categories c ON p.category_id = c.id ORDER BY p.name');
+  const result = await db.query(`
+    SELECT p.*,
+           c.name AS category_name,
+           pi.url AS primary_image_url
+    FROM utiam_products p
+    LEFT JOIN utiam_categories c ON p.category_id = c.id
+    LEFT JOIN utiam_product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
+    ORDER BY p.name
+  `);
   return result.rows;
 });
 
@@ -130,7 +140,6 @@ fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async
 
 
 // ─── IMAGES PRODUITS ──────────────────────────────────────
-// Lister les images d'un produit
 fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request) => {
   const result = await db.query(
     'SELECT * FROM utiam_product_images WHERE product_id = $1 ORDER BY is_primary DESC, position ASC, id ASC',
@@ -139,53 +148,43 @@ fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, a
   return result.rows;
 });
 
-// Uploader une image
 fastify.post('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const productId = request.params.id;
 
-  // Verifier que le produit existe
   const prodCheck = await db.query('SELECT id FROM utiam_products WHERE id = $1', [productId]);
   if (prodCheck.rows.length === 0) {
     return reply.status(404).send({ error: 'Produit introuvable' });
   }
 
-  // Recuperer le fichier uploade
   const data = await request.file();
   if (!data) {
     return reply.status(400).send({ error: 'Aucun fichier fourni' });
   }
 
-  // Verifier le type MIME
   if (!data.mimetype.startsWith('image/')) {
     return reply.status(400).send({ error: 'Le fichier doit etre une image' });
   }
 
-  // Charger sharp uniquement quand on en a besoin
   const sharp = require('sharp');
 
-  // Generer un nom unique
-  const ext = '.webp';  // toujours en webp pour la compression
+  const ext = '.webp';
   const filename = `${productId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
   const filepath = path.join(UPLOAD_DIR, filename);
 
-  // Compresser et redimensionner avec sharp (max 1200px, qualite 80%)
   const buffer = await data.toBuffer();
   await sharp(buffer)
     .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
     .webp({ quality: 80 })
     .toFile(filepath);
 
-  // URL publique
   const url = `/uploads/products/${filename}`;
 
-  // Verifier si c'est la premiere image (alors elle devient principale)
   const existing = await db.query(
     'SELECT COUNT(*) as cnt FROM utiam_product_images WHERE product_id = $1',
     [productId]
   );
   const isPrimary = parseInt(existing.rows[0].cnt) === 0;
 
-  // Enregistrer en BDD
   const result = await db.query(
     'INSERT INTO utiam_product_images (product_id, filename, url, is_primary, position) VALUES ($1, $2, $3, $4, $5) RETURNING *',
     [productId, filename, url, isPrimary, parseInt(existing.rows[0].cnt)]
@@ -194,7 +193,6 @@ fastify.post('/api/products/:id/images', { onRequest: [fastify.authenticate] }, 
   return reply.status(201).send(result.rows[0]);
 });
 
-// Definir une image comme principale
 fastify.put('/api/products/:id/images/:imageId/primary', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { id, imageId } = request.params;
   const client = await db.connect();
@@ -212,27 +210,22 @@ fastify.put('/api/products/:id/images/:imageId/primary', { onRequest: [fastify.a
   }
 });
 
-// Supprimer une image
 fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const imageId = request.params.imageId;
 
-  // Recuperer les infos de l'image
   const imgResult = await db.query('SELECT * FROM utiam_product_images WHERE id = $1', [imageId]);
   if (imgResult.rows.length === 0) {
     return reply.status(404).send({ error: 'Image introuvable' });
   }
   const img = imgResult.rows[0];
 
-  // Supprimer le fichier physique
   const filepath = path.join(UPLOAD_DIR, img.filename);
   if (fs.existsSync(filepath)) {
     fs.unlinkSync(filepath);
   }
 
-  // Supprimer en BDD
   await db.query('DELETE FROM utiam_product_images WHERE id = $1', [imageId]);
 
-  // Si c'etait l'image principale, en designer une autre comme principale
   if (img.is_primary) {
     await db.query(
       'UPDATE utiam_product_images SET is_primary = TRUE WHERE id = (SELECT id FROM utiam_product_images WHERE product_id = $1 ORDER BY position ASC LIMIT 1)',
