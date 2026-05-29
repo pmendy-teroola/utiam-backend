@@ -88,19 +88,36 @@ fastify.post('/api/categories', { onRequest: [fastify.authenticate] }, async (re
 });
 
 // ─── PRODUITS ─────────────────────────────────────────────
+// Le parametre ?status= filtre par statut.
+// - status omis ou 'active' : retourne uniquement les produits actifs (defaut)
+// - status='inactive' : uniquement les inactifs
+// - status='archived' : uniquement les archives
+// - status='all' : tous les produits (utilise par l'ecran de gestion avec filtre)
 fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (request) => {
-  const { search, barcode } = request.query;
+  const { search, barcode, status } = request.query;
+
   if (barcode) {
-    const result = await db.query('SELECT * FROM utiam_products WHERE barcode = $1', [barcode]);
+    // En caisse : ne renvoyer que les produits actifs
+    const result = await db.query(
+      "SELECT * FROM utiam_products WHERE barcode = $1 AND status = 'active'",
+      [barcode]
+    );
     return result.rows;
   }
   if (search) {
     const result = await db.query(
-      'SELECT * FROM utiam_products WHERE LOWER(name) LIKE LOWER($1) LIMIT 10',
+      "SELECT * FROM utiam_products WHERE LOWER(name) LIKE LOWER($1) AND status = 'active' LIMIT 10",
       [`%${search}%`]
     );
     return result.rows;
   }
+
+  // Filtre par statut (defaut = active)
+  let whereStatus = "p.status = 'active'";
+  if (status === 'inactive')       whereStatus = "p.status = 'inactive'";
+  else if (status === 'archived')  whereStatus = "p.status = 'archived'";
+  else if (status === 'all')       whereStatus = "TRUE";
+
   const result = await db.query(`
     SELECT p.*,
            c.name AS category_name,
@@ -108,25 +125,39 @@ fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (reque
     FROM utiam_products p
     LEFT JOIN utiam_categories c ON p.category_id = c.id
     LEFT JOIN utiam_product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
+    WHERE ${whereStatus}
     ORDER BY p.name
   `);
   return result.rows;
 });
 
 fastify.post('/api/products', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-  const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url } = request.body;
+  const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url, status } = request.body;
   const result = await db.query(
-    'INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-    [name, barcode, buy_price, sell_price, category_id, brand, unit || 'pcs', stock || 0, min_stock || 5, expiry_date || null, image_url || null]
+    'INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
+    [name, barcode, buy_price, sell_price, category_id, brand, unit || 'pcs', stock || 0, min_stock || 5, expiry_date || null, image_url || null, status || 'active']
   );
   return reply.status(201).send(result.rows[0]);
 });
 
 fastify.put('/api/products/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-  const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url } = request.body;
+  const { name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, image_url, status } = request.body;
   const result = await db.query(
-    'UPDATE utiam_products SET name=$1, barcode=$2, buy_price=$3, sell_price=$4, category_id=$5, brand=$6, unit=$7, stock=$8, min_stock=$9, expiry_date=$10, image_url=$11, updated_at=NOW() WHERE id=$12 RETURNING *',
-    [name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date || null, image_url || null, request.params.id]
+    'UPDATE utiam_products SET name=$1, barcode=$2, buy_price=$3, sell_price=$4, category_id=$5, brand=$6, unit=$7, stock=$8, min_stock=$9, expiry_date=$10, image_url=$11, status=COALESCE($12, status), updated_at=NOW() WHERE id=$13 RETURNING *',
+    [name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date || null, image_url || null, status || null, request.params.id]
+  );
+  return result.rows[0];
+});
+
+// Route dediee pour changer rapidement le statut (sans modifier les autres champs)
+fastify.put('/api/products/:id/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { status } = request.body;
+  if (!['active', 'inactive', 'archived'].includes(status)) {
+    return reply.status(400).send({ error: 'Statut invalide' });
+  }
+  const result = await db.query(
+    'UPDATE utiam_products SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+    [status, request.params.id]
   );
   return result.rows[0];
 });
@@ -138,9 +169,6 @@ fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async
 
 
 // ─── IMPORT CSV ───────────────────────────────────────────
-// Le frontend envoie une liste de lignes deja parsees, avec pour chaque ligne
-// une action choisie par l'utilisateur en cas de doublon.
-// Payload : { rows: [{ data: {...}, action: 'create' | 'update' | 'skip', existing_id?: N }] }
 fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { rows } = request.body;
   if (!Array.isArray(rows)) {
@@ -150,7 +178,6 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
   const client = await db.connect();
   const report = { created: 0, updated: 0, skipped: 0, errors: [] };
 
-  // Cache des categories pour eviter les requetes repetees
   const catCache = {};
   const allCats = await client.query('SELECT id, LOWER(name) as lname FROM utiam_categories');
   for (const c of allCats.rows) catCache[c.lname] = c.id;
@@ -163,13 +190,9 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
       const data = row.data || {};
       const action = row.action || 'create';
 
-      if (action === 'skip') {
-        report.skipped++;
-        continue;
-      }
+      if (action === 'skip') { report.skipped++; continue; }
 
       try {
-        // Resoudre la categorie (creer si elle n'existe pas)
         let categoryId = null;
         if (data.category && String(data.category).trim()) {
           const catName = String(data.category).trim();
@@ -186,7 +209,6 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
           }
         }
 
-        // Validation minimale
         if (!data.name || String(data.name).trim() === '') {
           report.errors.push({ line: i + 1, error: 'Nom manquant' });
           continue;
@@ -217,7 +239,7 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
           report.updated++;
         } else {
           await client.query(
-            'INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            "INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active')",
             payload
           );
           report.created++;
@@ -237,21 +259,15 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
   }
 });
 
-// Verifie les doublons avant import (recherche par code-barres)
-// Payload : { barcodes: ['xxx', 'yyy', ...] }
-// Retourne : { 'xxx': { id, name }, ... }
 fastify.post('/api/products/check-duplicates', { onRequest: [fastify.authenticate] }, async (request) => {
   const { barcodes } = request.body;
   if (!Array.isArray(barcodes) || barcodes.length === 0) return {};
-
   const result = await db.query(
     'SELECT id, name, barcode FROM utiam_products WHERE barcode = ANY($1)',
     [barcodes]
   );
   const map = {};
-  for (const r of result.rows) {
-    map[r.barcode] = { id: r.id, name: r.name };
-  }
+  for (const r of result.rows) map[r.barcode] = { id: r.id, name: r.name };
   return map;
 });
 
@@ -277,7 +293,6 @@ fastify.post('/api/products/:id/images', { onRequest: [fastify.authenticate] }, 
   if (!data) {
     return reply.status(400).send({ error: 'Aucun fichier fourni' });
   }
-
   if (!data.mimetype.startsWith('image/')) {
     return reply.status(400).send({ error: 'Le fichier doit etre une image' });
   }
@@ -328,27 +343,20 @@ fastify.put('/api/products/:id/images/:imageId/primary', { onRequest: [fastify.a
 
 fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const imageId = request.params.imageId;
-
   const imgResult = await db.query('SELECT * FROM utiam_product_images WHERE id = $1', [imageId]);
   if (imgResult.rows.length === 0) {
     return reply.status(404).send({ error: 'Image introuvable' });
   }
   const img = imgResult.rows[0];
-
   const filepath = path.join(UPLOAD_DIR, img.filename);
-  if (fs.existsSync(filepath)) {
-    fs.unlinkSync(filepath);
-  }
-
+  if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
   await db.query('DELETE FROM utiam_product_images WHERE id = $1', [imageId]);
-
   if (img.is_primary) {
     await db.query(
       'UPDATE utiam_product_images SET is_primary = TRUE WHERE id = (SELECT id FROM utiam_product_images WHERE product_id = $1 ORDER BY position ASC LIMIT 1)',
       [img.product_id]
     );
   }
-
   return reply.status(204).send();
 });
 
@@ -470,7 +478,7 @@ fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async
     [dateFrom, dateTo]
   );
   const lowStock = await db.query(
-    'SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock ORDER BY stock ASC'
+    "SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock AND status = 'active' ORDER BY stock ASC"
   );
   return {
     revenue: revenue.rows[0],
