@@ -28,7 +28,7 @@ fastify.register(require('@fastify/jwt'), {
   secret: process.env.JWT_SECRET || 'utiam_secret_key'
 });
 fastify.register(require('@fastify/multipart'), {
-  limits: { fileSize: 10 * 1024 * 1024 }  // 10 MB max
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 fastify.register(require('@fastify/static'), {
   root: UPLOAD_DIR,
@@ -88,8 +88,6 @@ fastify.post('/api/categories', { onRequest: [fastify.authenticate] }, async (re
 });
 
 // ─── PRODUITS ─────────────────────────────────────────────
-// La requete principale joint la table utiam_product_images pour recuperer
-// l'image principale (is_primary = true) et la mettre dans le champ primary_image_url
 fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (request) => {
   const { search, barcode } = request.query;
   if (barcode) {
@@ -139,6 +137,125 @@ fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async
 });
 
 
+// ─── IMPORT CSV ───────────────────────────────────────────
+// Le frontend envoie une liste de lignes deja parsees, avec pour chaque ligne
+// une action choisie par l'utilisateur en cas de doublon.
+// Payload : { rows: [{ data: {...}, action: 'create' | 'update' | 'skip', existing_id?: N }] }
+fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { rows } = request.body;
+  if (!Array.isArray(rows)) {
+    return reply.status(400).send({ error: 'Format invalide : rows attendu' });
+  }
+
+  const client = await db.connect();
+  const report = { created: 0, updated: 0, skipped: 0, errors: [] };
+
+  // Cache des categories pour eviter les requetes repetees
+  const catCache = {};
+  const allCats = await client.query('SELECT id, LOWER(name) as lname FROM utiam_categories');
+  for (const c of allCats.rows) catCache[c.lname] = c.id;
+
+  try {
+    await client.query('BEGIN');
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const data = row.data || {};
+      const action = row.action || 'create';
+
+      if (action === 'skip') {
+        report.skipped++;
+        continue;
+      }
+
+      try {
+        // Resoudre la categorie (creer si elle n'existe pas)
+        let categoryId = null;
+        if (data.category && String(data.category).trim()) {
+          const catName = String(data.category).trim();
+          const lname = catName.toLowerCase();
+          if (catCache[lname]) {
+            categoryId = catCache[lname];
+          } else {
+            const newCat = await client.query(
+              'INSERT INTO utiam_categories (name) VALUES ($1) RETURNING id',
+              [catName]
+            );
+            categoryId = newCat.rows[0].id;
+            catCache[lname] = categoryId;
+          }
+        }
+
+        // Validation minimale
+        if (!data.name || String(data.name).trim() === '') {
+          report.errors.push({ line: i + 1, error: 'Nom manquant' });
+          continue;
+        }
+        if (!data.sell_price || isNaN(Number(data.sell_price))) {
+          report.errors.push({ line: i + 1, error: 'Prix de vente invalide' });
+          continue;
+        }
+
+        const payload = [
+          String(data.name).trim(),
+          data.barcode ? String(data.barcode).trim() : null,
+          data.buy_price ? Number(data.buy_price) : null,
+          Number(data.sell_price),
+          categoryId,
+          data.brand ? String(data.brand).trim() : null,
+          data.unit ? String(data.unit).trim() : 'pcs',
+          data.stock ? Number(data.stock) : 0,
+          data.min_stock ? Number(data.min_stock) : 5,
+          data.expiry_date && String(data.expiry_date).trim() ? data.expiry_date : null,
+        ];
+
+        if (action === 'update' && row.existing_id) {
+          await client.query(
+            'UPDATE utiam_products SET name=$1, barcode=$2, buy_price=$3, sell_price=$4, category_id=$5, brand=$6, unit=$7, stock=$8, min_stock=$9, expiry_date=$10, updated_at=NOW() WHERE id=$11',
+            [...payload, row.existing_id]
+          );
+          report.updated++;
+        } else {
+          await client.query(
+            'INSERT INTO utiam_products (name, barcode, buy_price, sell_price, category_id, brand, unit, stock, min_stock, expiry_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            payload
+          );
+          report.created++;
+        }
+      } catch (err) {
+        report.errors.push({ line: i + 1, error: err.message });
+      }
+    }
+
+    await client.query('COMMIT');
+    return report;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// Verifie les doublons avant import (recherche par code-barres)
+// Payload : { barcodes: ['xxx', 'yyy', ...] }
+// Retourne : { 'xxx': { id, name }, ... }
+fastify.post('/api/products/check-duplicates', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { barcodes } = request.body;
+  if (!Array.isArray(barcodes) || barcodes.length === 0) return {};
+
+  const result = await db.query(
+    'SELECT id, name, barcode FROM utiam_products WHERE barcode = ANY($1)',
+    [barcodes]
+  );
+  const map = {};
+  for (const r of result.rows) {
+    map[r.barcode] = { id: r.id, name: r.name };
+  }
+  return map;
+});
+
+
 // ─── IMAGES PRODUITS ──────────────────────────────────────
 fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request) => {
   const result = await db.query(
@@ -166,7 +283,6 @@ fastify.post('/api/products/:id/images', { onRequest: [fastify.authenticate] }, 
   }
 
   const sharp = require('sharp');
-
   const ext = '.webp';
   const filename = `${productId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
   const filepath = path.join(UPLOAD_DIR, filename);
