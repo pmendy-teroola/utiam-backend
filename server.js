@@ -35,13 +35,9 @@ fastify.register(require('@fastify/static'), {
   prefix: '/uploads/products/',
 });
 
-// Middleware auth
 fastify.decorate('authenticate', async function(request, reply) {
-  try {
-    await request.jwtVerify();
-  } catch (err) {
-    reply.status(401).send({ error: 'Non autorise' });
-  }
+  try { await request.jwtVerify(); }
+  catch (err) { reply.status(401).send({ error: 'Non autorise' }); }
 });
 
 // ─── HEALTH ───────────────────────────────────────────────
@@ -54,67 +50,44 @@ fastify.post('/api/auth/login', async (request, reply) => {
     'SELECT * FROM utiam_users WHERE email = $1 AND is_active = true',
     [email]
   );
-  if (result.rows.length === 0) {
-    return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
-  }
+  if (result.rows.length === 0) return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
   const user = result.rows[0];
   const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) {
-    return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
-  }
+  if (!valid) return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
   const token = fastify.jwt.sign({
-    id: user.id,
-    email: user.email,
-    role: user.role,
-    display_name: user.display_name
+    id: user.id, email: user.email, role: user.role, display_name: user.display_name
   }, { expiresIn: '24h' });
   return { token, user: { id: user.id, email: user.email, role: user.role, display_name: user.display_name } };
 });
-
 
 // ─── CATEGORIES ───────────────────────────────────────────
 fastify.get('/api/categories', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query('SELECT * FROM utiam_categories ORDER BY name');
   return result.rows;
 });
-
 fastify.post('/api/categories', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { name } = request.body;
-  const result = await db.query(
-    'INSERT INTO utiam_categories (name) VALUES ($1) RETURNING *',
-    [name]
-  );
+  const result = await db.query('INSERT INTO utiam_categories (name) VALUES ($1) RETURNING *', [name]);
   return reply.status(201).send(result.rows[0]);
 });
 
 // ─── PRODUITS ─────────────────────────────────────────────
 fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (request) => {
   const { search, barcode, status } = request.query;
-
   if (barcode) {
-    const result = await db.query(
-      "SELECT * FROM utiam_products WHERE barcode = $1 AND status = 'active'",
-      [barcode]
-    );
+    const result = await db.query("SELECT * FROM utiam_products WHERE barcode = $1 AND status = 'active'", [barcode]);
     return result.rows;
   }
   if (search) {
-    const result = await db.query(
-      "SELECT * FROM utiam_products WHERE LOWER(name) LIKE LOWER($1) AND status = 'active' LIMIT 10",
-      [`%${search}%`]
-    );
+    const result = await db.query("SELECT * FROM utiam_products WHERE LOWER(name) LIKE LOWER($1) AND status = 'active' LIMIT 10", [`%${search}%`]);
     return result.rows;
   }
-
   let whereStatus = "p.status = 'active'";
   if (status === 'inactive')       whereStatus = "p.status = 'inactive'";
   else if (status === 'archived')  whereStatus = "p.status = 'archived'";
   else if (status === 'all')       whereStatus = "TRUE";
-
   const result = await db.query(`
-    SELECT p.*,
-           c.name AS category_name,
-           pi.url AS primary_image_url
+    SELECT p.*, c.name AS category_name, pi.url AS primary_image_url
     FROM utiam_products p
     LEFT JOIN utiam_categories c ON p.category_id = c.id
     LEFT JOIN utiam_product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
@@ -147,10 +120,7 @@ fastify.put('/api/products/:id/status', { onRequest: [fastify.authenticate] }, a
   if (!['active', 'inactive', 'archived'].includes(status)) {
     return reply.status(400).send({ error: 'Statut invalide' });
   }
-  const result = await db.query(
-    'UPDATE utiam_products SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-    [status, request.params.id]
-  );
+  const result = await db.query('UPDATE utiam_products SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, request.params.id]);
   return result.rows[0];
 });
 
@@ -163,9 +133,7 @@ fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async
 // ─── IMPORT CSV ───────────────────────────────────────────
 fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { rows } = request.body;
-  if (!Array.isArray(rows)) {
-    return reply.status(400).send({ error: 'Format invalide : rows attendu' });
-  }
+  if (!Array.isArray(rows)) return reply.status(400).send({ error: 'Format invalide : rows attendu' });
   const client = await db.connect();
   const report = { created: 0, updated: 0, skipped: 0, errors: [] };
   const catCache = {};
@@ -185,22 +153,13 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
           const lname = catName.toLowerCase();
           if (catCache[lname]) categoryId = catCache[lname];
           else {
-            const newCat = await client.query(
-              'INSERT INTO utiam_categories (name) VALUES ($1) RETURNING id',
-              [catName]
-            );
+            const newCat = await client.query('INSERT INTO utiam_categories (name) VALUES ($1) RETURNING id', [catName]);
             categoryId = newCat.rows[0].id;
             catCache[lname] = categoryId;
           }
         }
-        if (!data.name || String(data.name).trim() === '') {
-          report.errors.push({ line: i + 1, error: 'Nom manquant' });
-          continue;
-        }
-        if (!data.sell_price || isNaN(Number(data.sell_price))) {
-          report.errors.push({ line: i + 1, error: 'Prix de vente invalide' });
-          continue;
-        }
+        if (!data.name || String(data.name).trim() === '') { report.errors.push({ line: i + 1, error: 'Nom manquant' }); continue; }
+        if (!data.sell_price || isNaN(Number(data.sell_price))) { report.errors.push({ line: i + 1, error: 'Prix de vente invalide' }); continue; }
         const payload = [
           String(data.name).trim(),
           data.barcode ? String(data.barcode).trim() : null,
@@ -226,27 +185,18 @@ fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, asyn
           );
           report.created++;
         }
-      } catch (err) {
-        report.errors.push({ line: i + 1, error: err.message });
-      }
+      } catch (err) { report.errors.push({ line: i + 1, error: err.message }); }
     }
     await client.query('COMMIT');
     return report;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
 fastify.post('/api/products/check-duplicates', { onRequest: [fastify.authenticate] }, async (request) => {
   const { barcodes } = request.body;
   if (!Array.isArray(barcodes) || barcodes.length === 0) return {};
-  const result = await db.query(
-    'SELECT id, name, barcode FROM utiam_products WHERE barcode = ANY($1)',
-    [barcodes]
-  );
+  const result = await db.query('SELECT id, name, barcode FROM utiam_products WHERE barcode = ANY($1)', [barcodes]);
   const map = {};
   for (const r of result.rows) map[r.barcode] = { id: r.id, name: r.name };
   return map;
@@ -255,10 +205,7 @@ fastify.post('/api/products/check-duplicates', { onRequest: [fastify.authenticat
 
 // ─── IMAGES PRODUITS ──────────────────────────────────────
 fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request) => {
-  const result = await db.query(
-    'SELECT * FROM utiam_product_images WHERE product_id = $1 ORDER BY is_primary DESC, position ASC, id ASC',
-    [request.params.id]
-  );
+  const result = await db.query('SELECT * FROM utiam_product_images WHERE product_id = $1 ORDER BY is_primary DESC, position ASC, id ASC', [request.params.id]);
   return result.rows;
 });
 
@@ -294,9 +241,8 @@ fastify.put('/api/products/:id/images/:imageId/primary', { onRequest: [fastify.a
     await client.query('UPDATE utiam_product_images SET is_primary = TRUE WHERE id = $1 AND product_id = $2', [imageId, id]);
     await client.query('COMMIT');
     return { success: true };
-  } catch (err) {
-    await client.query('ROLLBACK'); throw err;
-  } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
 fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
@@ -322,16 +268,11 @@ fastify.get('/api/clients', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query('SELECT * FROM utiam_clients ORDER BY name');
   return result.rows;
 });
-
 fastify.post('/api/clients', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { name, phone, email } = request.body;
-  const result = await db.query(
-    'INSERT INTO utiam_clients (name, phone, email) VALUES ($1,$2,$3) RETURNING *',
-    [name, phone || null, email || null]
-  );
+  const result = await db.query('INSERT INTO utiam_clients (name, phone, email) VALUES ($1,$2,$3) RETURNING *', [name, phone || null, email || null]);
   return reply.status(201).send(result.rows[0]);
 });
-
 fastify.put('/api/clients/:id', { onRequest: [fastify.authenticate] }, async (request) => {
   const { name, phone, email, credit, loyalty_points } = request.body;
   const result = await db.query(
@@ -378,31 +319,22 @@ fastify.post('/api/sales', { onRequest: [fastify.authenticate] }, async (request
     }
     await client.query('COMMIT');
     return reply.status(201).send(sale);
-  } catch (err) {
-    await client.query('ROLLBACK'); throw err;
-  } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
 
-// ═════════════════════════════════════════════════════════
 // ─── STOCK ────────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════
-
-// Liste des mouvements avec filtres optionnels
-// Query : ?type=sale|restock|delivery|adjustment|inventory  ?product_id=N  ?from=YYYY-MM-DD  ?to=YYYY-MM-DD  ?limit=N
 fastify.get('/api/stock/movements', { onRequest: [fastify.authenticate] }, async (request) => {
   const { type, product_id, from, to, limit } = request.query;
   const conditions = [];
   const params = [];
-
   if (type) { conditions.push(`sm.type = $${params.length + 1}`); params.push(type); }
   if (product_id) { conditions.push(`sm.product_id = $${params.length + 1}`); params.push(product_id); }
   if (from) { conditions.push(`sm.created_at::date >= $${params.length + 1}`); params.push(from); }
   if (to) { conditions.push(`sm.created_at::date <= $${params.length + 1}`); params.push(to); }
-
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   params.push(Number(limit) || 200);
-
   const result = await db.query(
     `SELECT sm.*, p.name as product_name, p.unit, u.display_name as user_name
      FROM utiam_stock_movements sm
@@ -416,16 +348,10 @@ fastify.get('/api/stock/movements', { onRequest: [fastify.authenticate] }, async
   return result.rows;
 });
 
-// Mouvement simple : restock ou adjustment
-// Body : { product_id, type, quantity, reason?, unit_price? }
 fastify.post('/api/stock/movements', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { product_id, type, quantity, reason, unit_price } = request.body;
   const user_id = request.user.id;
-
-  if (!['restock', 'adjustment'].includes(type)) {
-    return reply.status(400).send({ error: 'Type invalide. Utilisez restock ou adjustment.' });
-  }
-
+  if (!['restock', 'adjustment'].includes(type)) return reply.status(400).send({ error: 'Type invalide. Utilisez restock ou adjustment.' });
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -433,33 +359,20 @@ fastify.post('/api/stock/movements', { onRequest: [fastify.authenticate] }, asyn
       'INSERT INTO utiam_stock_movements (product_id, type, quantity, reason, unit_price, user_id) VALUES ($1,$2,$3,$4,$5,$6)',
       [product_id, type, quantity, reason || null, unit_price || null, user_id]
     );
-    // restock : delta = quantity (positif)
-    // adjustment : delta = quantity (peut etre positif ou negatif selon ce que l'utilisateur envoie)
     const delta = type === 'restock' ? Math.abs(quantity) : Number(quantity);
-    await client.query(
-      'UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2',
-      [delta, product_id]
-    );
+    await client.query('UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [delta, product_id]);
     await client.query('COMMIT');
     return reply.status(201).send({ success: true });
-  } catch (err) {
-    await client.query('ROLLBACK'); throw err;
-  } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
-// Bon de reception : plusieurs produits en une seule transaction
-// Body : { items: [{ product_id, quantity, unit_price? }], reason?, supplier? }
 fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { items, reason, supplier } = request.body;
   const user_id = request.user.id;
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return reply.status(400).send({ error: 'Aucun produit a receptionner' });
-  }
-
+  if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun produit a receptionner' });
   const batch_ref = 'BR-' + Date.now();
   const note = supplier ? `Fournisseur: ${supplier}${reason ? ' - ' + reason : ''}` : (reason || null);
-
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -469,81 +382,51 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
         'INSERT INTO utiam_stock_movements (product_id, type, quantity, reason, unit_price, batch_ref, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
         [item.product_id, 'delivery', Math.abs(item.quantity), note, item.unit_price || null, batch_ref, user_id]
       );
-      await client.query(
-        'UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2',
-        [Math.abs(item.quantity), item.product_id]
-      );
+      await client.query('UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [Math.abs(item.quantity), item.product_id]);
     }
     await client.query('COMMIT');
     return reply.status(201).send({ success: true, batch_ref, count: items.length });
-  } catch (err) {
-    await client.query('ROLLBACK'); throw err;
-  } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
-// Soumission d'inventaire physique : batch d'ajustements
-// Body : { items: [{ product_id, counted_quantity }], reason? }
-// Le serveur calcule l'ecart par rapport au stock actuel et applique les ajustements
 fastify.post('/api/stock/inventory', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { items, reason } = request.body;
   const user_id = request.user.id;
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return reply.status(400).send({ error: 'Aucun produit dans l\'inventaire' });
-  }
-
+  if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun produit dans l\'inventaire' });
   const batch_ref = 'INV-' + Date.now();
   const note = reason || 'Inventaire physique';
-
   const client = await db.connect();
   const adjustments = [];
-
   try {
     await client.query('BEGIN');
     for (const item of items) {
       if (!item.product_id) continue;
       const counted = Number(item.counted_quantity);
       if (isNaN(counted) || counted < 0) continue;
-
-      // Stock actuel
       const cur = await client.query('SELECT stock, name FROM utiam_products WHERE id = $1', [item.product_id]);
       if (cur.rows.length === 0) continue;
       const currentStock = Number(cur.rows[0].stock);
       const delta = counted - currentStock;
-
-      if (delta === 0) continue;  // pas d'ecart, pas de mouvement
-
+      if (delta === 0) continue;
       await client.query(
         'INSERT INTO utiam_stock_movements (product_id, type, quantity, reason, batch_ref, user_id) VALUES ($1, $2, $3, $4, $5, $6)',
         [item.product_id, 'inventory', delta, note, batch_ref, user_id]
       );
-      await client.query(
-        'UPDATE utiam_products SET stock = $1, updated_at = NOW() WHERE id = $2',
-        [counted, item.product_id]
-      );
+      await client.query('UPDATE utiam_products SET stock = $1, updated_at = NOW() WHERE id = $2', [counted, item.product_id]);
       adjustments.push({ product_id: item.product_id, name: cur.rows[0].name, before: currentStock, after: counted, delta });
     }
     await client.query('COMMIT');
     return reply.status(201).send({ success: true, batch_ref, adjustments });
-  } catch (err) {
-    await client.query('ROLLBACK'); throw err;
-  } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
 });
 
-// Resume pour dashboard stock
 fastify.get('/api/stock/summary', { onRequest: [fastify.authenticate] }, async () => {
-  const out_of_stock = await db.query(
-    "SELECT id, name, barcode, unit FROM utiam_products WHERE stock = 0 AND status = 'active' ORDER BY name"
-  );
-  const low_stock = await db.query(
-    "SELECT id, name, stock, min_stock, unit FROM utiam_products WHERE stock > 0 AND stock <= min_stock AND status = 'active' ORDER BY stock ASC"
-  );
-  const expiring_soon = await db.query(
-    "SELECT id, name, expiry_date, stock, unit FROM utiam_products WHERE expiry_date IS NOT NULL AND expiry_date <= NOW() + INTERVAL '30 days' AND expiry_date >= CURRENT_DATE AND status = 'active' AND stock > 0 ORDER BY expiry_date ASC"
-  );
-  const expired = await db.query(
-    "SELECT id, name, expiry_date, stock, unit FROM utiam_products WHERE expiry_date IS NOT NULL AND expiry_date < CURRENT_DATE AND status = 'active' AND stock > 0 ORDER BY expiry_date ASC"
-  );
+  const out_of_stock = await db.query("SELECT id, name, barcode, unit FROM utiam_products WHERE stock = 0 AND status = 'active' ORDER BY name");
+  const low_stock = await db.query("SELECT id, name, stock, min_stock, unit FROM utiam_products WHERE stock > 0 AND stock <= min_stock AND status = 'active' ORDER BY stock ASC");
+  const expiring_soon = await db.query("SELECT id, name, expiry_date, stock, unit FROM utiam_products WHERE expiry_date IS NOT NULL AND expiry_date <= NOW() + INTERVAL '30 days' AND expiry_date >= CURRENT_DATE AND status = 'active' AND stock > 0 ORDER BY expiry_date ASC");
+  const expired = await db.query("SELECT id, name, expiry_date, stock, unit FROM utiam_products WHERE expiry_date IS NOT NULL AND expiry_date < CURRENT_DATE AND status = 'active' AND stock > 0 ORDER BY expiry_date ASC");
   return {
     out_of_stock: out_of_stock.rows,
     low_stock: low_stock.rows,
@@ -553,34 +436,155 @@ fastify.get('/api/stock/summary', { onRequest: [fastify.authenticate] }, async (
 });
 
 
+// ═════════════════════════════════════════════════════════
 // ─── RAPPORTS ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════
+
+// Rapport complet pour la periode demandee
+// Query : ?from=YYYY-MM-DD ?to=YYYY-MM-DD (defaut : mois en cours)
 fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async (request) => {
   const { from, to } = request.query;
   const dateFrom = from || new Date(new Date().setDate(1)).toISOString().split('T')[0];
   const dateTo = to || new Date().toISOString().split('T')[0];
+
+  // 1. CA total + nombre de ventes + panier moyen
   const revenue = await db.query(
-    'SELECT COALESCE(SUM(total),0) as total, COUNT(*) as count FROM utiam_sales WHERE created_at::date BETWEEN $1 AND $2',
+    `SELECT
+       COALESCE(SUM(total), 0) as total,
+       COUNT(*) as count,
+       COALESCE(AVG(total), 0) as avg_basket
+     FROM utiam_sales
+     WHERE created_at::date BETWEEN $1 AND $2`,
     [dateFrom, dateTo]
   );
+
+  // 2. Top 10 produits vendus
   const topProducts = await db.query(
-    'SELECT p.name, SUM(si.quantity) as qty, SUM(si.total) as revenue FROM utiam_sale_items si JOIN utiam_products p ON si.product_id = p.id JOIN utiam_sales s ON si.sale_id = s.id WHERE s.created_at::date BETWEEN $1 AND $2 GROUP BY p.name ORDER BY qty DESC LIMIT 5',
+    `SELECT p.name, SUM(si.quantity) as qty, SUM(si.total) as revenue
+     FROM utiam_sale_items si
+     JOIN utiam_products p ON si.product_id = p.id
+     JOIN utiam_sales s ON si.sale_id = s.id
+     WHERE s.created_at::date BETWEEN $1 AND $2
+     GROUP BY p.name
+     ORDER BY qty DESC
+     LIMIT 10`,
     [dateFrom, dateTo]
   );
-  const lowStock = await db.query(
-    "SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock AND status = 'active' ORDER BY stock ASC"
+
+  // 3. Top 10 clients (CA)
+  const topClients = await db.query(
+    `SELECT c.id, c.name, c.phone, COUNT(s.id) as visits, SUM(s.total) as revenue
+     FROM utiam_sales s
+     JOIN utiam_clients c ON s.client_id = c.id
+     WHERE s.created_at::date BETWEEN $1 AND $2 AND s.client_id IS NOT NULL
+     GROUP BY c.id, c.name, c.phone
+     ORDER BY revenue DESC
+     LIMIT 10`,
+    [dateFrom, dateTo]
   );
+
+  // 4. Ventilation par mode de paiement
+  const paymentMethods = await db.query(
+    `SELECT payment_method, COUNT(*) as count, SUM(total) as total
+     FROM utiam_sales
+     WHERE created_at::date BETWEEN $1 AND $2
+     GROUP BY payment_method
+     ORDER BY total DESC`,
+    [dateFrom, dateTo]
+  );
+
+  // 5. CA par tranche horaire (24 tranches)
+  const hourlySales = await db.query(
+    `SELECT EXTRACT(HOUR FROM created_at)::int as hour, COUNT(*) as count, SUM(total) as total
+     FROM utiam_sales
+     WHERE created_at::date BETWEEN $1 AND $2
+     GROUP BY EXTRACT(HOUR FROM created_at)
+     ORDER BY hour ASC`,
+    [dateFrom, dateTo]
+  );
+
+  // 6. CA par caissier
+  const cashiers = await db.query(
+    `SELECT u.id, u.display_name, u.role, COUNT(s.id) as count, SUM(s.total) as total, AVG(s.total) as avg_basket
+     FROM utiam_sales s
+     JOIN utiam_users u ON s.cashier_id = u.id
+     WHERE s.created_at::date BETWEEN $1 AND $2
+     GROUP BY u.id, u.display_name, u.role
+     ORDER BY total DESC`,
+    [dateFrom, dateTo]
+  );
+
+  // 7. Marge brute estimee (CA - cout des marchandises vendues)
+  const marginResult = await db.query(
+    `SELECT
+       COALESCE(SUM(si.total), 0) as revenue,
+       COALESCE(SUM(si.quantity * COALESCE(p.buy_price, 0)), 0) as cost
+     FROM utiam_sale_items si
+     JOIN utiam_products p ON si.product_id = p.id
+     JOIN utiam_sales s ON si.sale_id = s.id
+     WHERE s.created_at::date BETWEEN $1 AND $2`,
+    [dateFrom, dateTo]
+  );
+  const margin = {
+    revenue: Number(marginResult.rows[0].revenue),
+    cost: Number(marginResult.rows[0].cost),
+    gross: Number(marginResult.rows[0].revenue) - Number(marginResult.rows[0].cost),
+    rate: Number(marginResult.rows[0].revenue) > 0
+      ? ((Number(marginResult.rows[0].revenue) - Number(marginResult.rows[0].cost)) / Number(marginResult.rows[0].revenue)) * 100
+      : 0,
+  };
+
+  // 8. Alertes stock
+  const lowStock = await db.query(
+    "SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock AND status = 'active' ORDER BY stock ASC LIMIT 20"
+  );
+  const outOfStock = await db.query(
+    "SELECT name, barcode FROM utiam_products WHERE stock = 0 AND status = 'active' ORDER BY name LIMIT 20"
+  );
+
   return {
-    revenue: revenue.rows[0],
+    period: { from: dateFrom, to: dateTo },
+    revenue: {
+      total: Number(revenue.rows[0].total),
+      count: Number(revenue.rows[0].count),
+      avg_basket: Number(revenue.rows[0].avg_basket),
+    },
     top_products: topProducts.rows,
-    low_stock: lowStock.rows
+    top_clients: topClients.rows,
+    payment_methods: paymentMethods.rows,
+    hourly_sales: hourlySales.rows,
+    cashiers: cashiers.rows,
+    margin,
+    low_stock: lowStock.rows,
+    out_of_stock: outOfStock.rows,
   };
 });
 
+// Valeur du stock actuel (a prix achat et a prix vente)
+fastify.get('/api/reports/stock-value', { onRequest: [fastify.authenticate] }, async () => {
+  const result = await db.query(
+    `SELECT
+       COUNT(*) as product_count,
+       COALESCE(SUM(stock), 0) as total_units,
+       COALESCE(SUM(stock * COALESCE(buy_price, 0)), 0) as value_buy,
+       COALESCE(SUM(stock * sell_price), 0) as value_sell
+     FROM utiam_products
+     WHERE status = 'active' AND stock > 0`
+  );
+  const row = result.rows[0];
+  return {
+    product_count: Number(row.product_count),
+    total_units: Number(row.total_units),
+    value_buy: Number(row.value_buy),
+    value_sell: Number(row.value_sell),
+    potential_margin: Number(row.value_sell) - Number(row.value_buy),
+  };
+});
+
+
 // ─── UTILISATEURS ─────────────────────────────────────────
 fastify.get('/api/users', { onRequest: [fastify.authenticate] }, async () => {
-  const result = await db.query(
-    'SELECT id, email, display_name, role, is_active, created_at FROM utiam_users ORDER BY created_at DESC'
-  );
+  const result = await db.query('SELECT id, email, display_name, role, is_active, created_at FROM utiam_users ORDER BY created_at DESC');
   return result.rows;
 });
 
