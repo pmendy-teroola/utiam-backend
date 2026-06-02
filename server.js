@@ -28,7 +28,6 @@ fastify.decorate('authenticate', async function(request, reply) {
   catch (err) { reply.status(401).send({ error: 'Non autorise' }); }
 });
 
-// ─── HELPERS SECURITE ─────────────────────────────────────
 function validatePasswordStrength(password) {
   if (!password || typeof password !== 'string') return 'Mot de passe requis';
   if (password.length < 8) return 'Le mot de passe doit contenir au moins 8 caracteres';
@@ -50,13 +49,7 @@ fastify.post('/api/auth/login', async (request, reply) => {
   const token = fastify.jwt.sign({ id: user.id, email: user.email, role: user.role, display_name: user.display_name }, { expiresIn: '24h' });
   return {
     token,
-    user: {
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      display_name: user.display_name,
-      must_change_password: user.must_change_password === true,
-    }
+    user: { id: user.id, email: user.email, role: user.role, display_name: user.display_name, must_change_password: user.must_change_password === true }
   };
 });
 
@@ -73,7 +66,7 @@ fastify.post('/api/categories', { onRequest: [fastify.authenticate] }, async (re
 
 // ─── PRODUITS ─────────────────────────────────────────────
 fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (request) => {
-  const { search, barcode, status } = request.query;
+  const { search, barcode, status, supplier_id } = request.query;
   if (barcode) {
     const result = await db.query("SELECT * FROM utiam_products WHERE barcode = $1 AND status = 'active'", [barcode]);
     return result.rows;
@@ -86,14 +79,26 @@ fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (reque
   if (status === 'inactive')       whereStatus = "p.status = 'inactive'";
   else if (status === 'archived')  whereStatus = "p.status = 'archived'";
   else if (status === 'all')       whereStatus = "TRUE";
+
+  // Filtre par fournisseur (optionnel)
+  let supplierJoin = '';
+  let supplierWhere = '';
+  const params = [];
+  if (supplier_id) {
+    supplierJoin = 'INNER JOIN utiam_product_suppliers psf ON psf.product_id = p.id';
+    supplierWhere = `AND psf.supplier_id = $${params.length + 1}`;
+    params.push(supplier_id);
+  }
+
   const result = await db.query(`
     SELECT p.*, c.name AS category_name, pi.url AS primary_image_url
     FROM utiam_products p
     LEFT JOIN utiam_categories c ON p.category_id = c.id
     LEFT JOIN utiam_product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
-    WHERE ${whereStatus}
+    ${supplierJoin}
+    WHERE ${whereStatus} ${supplierWhere}
     ORDER BY p.name
-  `);
+  `, params);
   return result.rows;
 });
 
@@ -258,6 +263,349 @@ fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, as
   return reply.status(204).send();
 });
 
+
+// ═════════════════════════════════════════════════════════
+// ─── FOURNISSEURS ─────────────────────────────────────────
+// ═════════════════════════════════════════════════════════
+
+// Liste des fournisseurs avec stats
+fastify.get('/api/suppliers', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { active } = request.query;
+  let whereActive = '';
+  if (active === 'true') whereActive = 'WHERE s.is_active = TRUE';
+  else if (active === 'false') whereActive = 'WHERE s.is_active = FALSE';
+
+  const result = await db.query(`
+    SELECT s.*,
+           COALESCE(stats.products_count, 0) as products_count,
+           COALESCE(stats.total_received, 0) as total_received,
+           stats.last_delivery,
+           COALESCE(pos.po_count, 0) as po_count,
+           COALESCE(pos.po_total, 0) as po_total,
+           COALESCE(payments.total_paid, 0) as total_paid
+    FROM utiam_suppliers s
+    LEFT JOIN (
+      SELECT supplier_id, COUNT(DISTINCT product_id) as products_count
+      FROM utiam_product_suppliers GROUP BY supplier_id
+    ) stats ON stats.supplier_id = s.id
+    LEFT JOIN (
+      SELECT po.supplier_id,
+             SUM(CASE WHEN po.status IN ('received', 'partial', 'settled') THEN po.total ELSE 0 END) as total_received,
+             MAX(po.received_at) as last_delivery,
+             COUNT(po.id) as po_count,
+             SUM(po.total) as po_total
+      FROM utiam_purchase_orders po GROUP BY po.supplier_id
+    ) pos ON pos.supplier_id = s.id
+    LEFT JOIN (
+      SELECT supplier_id, SUM(amount) as total_paid
+      FROM utiam_supplier_payments GROUP BY supplier_id
+    ) payments ON payments.supplier_id = s.id
+    ${whereActive}
+    ORDER BY s.name
+  `);
+  return result.rows;
+});
+
+// Detail d'un fournisseur
+fastify.get('/api/suppliers/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const supplierRes = await db.query('SELECT * FROM utiam_suppliers WHERE id = $1', [id]);
+  if (supplierRes.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
+
+  // Stats
+  const products = await db.query(`
+    SELECT ps.*, p.name as product_name, p.unit, p.stock
+    FROM utiam_product_suppliers ps
+    JOIN utiam_products p ON p.id = ps.product_id
+    WHERE ps.supplier_id = $1
+    ORDER BY p.name
+  `, [id]);
+
+  const purchaseOrders = await db.query(`
+    SELECT po.*, u.display_name as user_name,
+           (SELECT COUNT(*) FROM utiam_purchase_order_items WHERE purchase_order_id = po.id) as items_count
+    FROM utiam_purchase_orders po
+    JOIN utiam_users u ON u.id = po.user_id
+    WHERE po.supplier_id = $1
+    ORDER BY po.created_at DESC LIMIT 50
+  `, [id]);
+
+  const payments = await db.query(`
+    SELECT sp.*, u.display_name as user_name, po.reference as po_reference
+    FROM utiam_supplier_payments sp
+    JOIN utiam_users u ON u.id = sp.user_id
+    LEFT JOIN utiam_purchase_orders po ON po.id = sp.purchase_order_id
+    WHERE sp.supplier_id = $1
+    ORDER BY sp.created_at DESC LIMIT 50
+  `, [id]);
+
+  // Calcul du solde du
+  const balanceRes = await db.query(`
+    SELECT
+      COALESCE((SELECT SUM(total) FROM utiam_purchase_orders WHERE supplier_id = $1 AND status IN ('received', 'settled')), 0) as total_received,
+      COALESCE((SELECT SUM(amount) FROM utiam_supplier_payments WHERE supplier_id = $1), 0) as total_paid
+  `, [id]);
+  const balance = Number(balanceRes.rows[0].total_received) - Number(balanceRes.rows[0].total_paid);
+
+  return {
+    ...supplierRes.rows[0],
+    products: products.rows,
+    purchase_orders: purchaseOrders.rows,
+    payments: payments.rows,
+    balance,
+    total_received: Number(balanceRes.rows[0].total_received),
+    total_paid: Number(balanceRes.rows[0].total_paid),
+  };
+});
+
+fastify.post('/api/suppliers', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { name, phone, email, address, payment_terms, notes } = request.body;
+  if (!name || !String(name).trim()) return reply.status(400).send({ error: 'Le nom est obligatoire' });
+  const result = await db.query(
+    'INSERT INTO utiam_suppliers (name, phone, email, address, payment_terms, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+    [String(name).trim(), phone || null, email || null, address || null, payment_terms || 'comptant', notes || null]
+  );
+  return reply.status(201).send(result.rows[0]);
+});
+
+fastify.put('/api/suppliers/:id', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { name, phone, email, address, payment_terms, notes } = request.body;
+  const result = await db.query(
+    'UPDATE utiam_suppliers SET name=$1, phone=$2, email=$3, address=$4, payment_terms=$5, notes=$6, updated_at=NOW() WHERE id=$7 RETURNING *',
+    [name, phone || null, email || null, address || null, payment_terms || 'comptant', notes || null, request.params.id]
+  );
+  return result.rows[0];
+});
+
+fastify.put('/api/suppliers/:id/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { is_active } = request.body;
+  if (typeof is_active !== 'boolean') return reply.status(400).send({ error: 'is_active doit etre un booleen' });
+  const result = await db.query(
+    'UPDATE utiam_suppliers SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+    [is_active, request.params.id]
+  );
+  if (result.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
+  return result.rows[0];
+});
+
+// ─── PRODUIT <-> FOURNISSEURS ────────────────────────────
+fastify.get('/api/products/:id/suppliers', { onRequest: [fastify.authenticate] }, async (request) => {
+  const result = await db.query(`
+    SELECT ps.*, s.name as supplier_name, s.phone, s.email
+    FROM utiam_product_suppliers ps
+    JOIN utiam_suppliers s ON s.id = ps.supplier_id
+    WHERE ps.product_id = $1
+    ORDER BY ps.is_primary DESC, ps.unit_price ASC NULLS LAST
+  `, [request.params.id]);
+  return result.rows;
+});
+
+fastify.post('/api/products/:id/suppliers', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const { supplier_id, unit_price, is_primary, notes } = request.body;
+  if (!supplier_id) return reply.status(400).send({ error: 'supplier_id requis' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Si is_primary = true, retirer le flag des autres
+    if (is_primary) {
+      await client.query('UPDATE utiam_product_suppliers SET is_primary = FALSE WHERE product_id = $1', [id]);
+    }
+    // Verifier si la liaison existe deja
+    const existing = await client.query('SELECT id FROM utiam_product_suppliers WHERE product_id = $1 AND supplier_id = $2', [id, supplier_id]);
+    let result;
+    if (existing.rows.length > 0) {
+      result = await client.query(
+        'UPDATE utiam_product_suppliers SET unit_price = $1, is_primary = $2, notes = $3 WHERE id = $4 RETURNING *',
+        [unit_price || null, !!is_primary, notes || null, existing.rows[0].id]
+      );
+    } else {
+      result = await client.query(
+        'INSERT INTO utiam_product_suppliers (product_id, supplier_id, unit_price, is_primary, notes) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [id, supplier_id, unit_price || null, !!is_primary, notes || null]
+      );
+    }
+    await client.query('COMMIT');
+    return reply.status(201).send(result.rows[0]);
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
+});
+
+fastify.put('/api/products/:id/suppliers/:supplierId/primary', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { id, supplierId } = request.params;
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE utiam_product_suppliers SET is_primary = FALSE WHERE product_id = $1', [id]);
+    await client.query('UPDATE utiam_product_suppliers SET is_primary = TRUE WHERE product_id = $1 AND supplier_id = $2', [id, supplierId]);
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
+});
+
+fastify.delete('/api/products/:id/suppliers/:supplierId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id, supplierId } = request.params;
+  await db.query('DELETE FROM utiam_product_suppliers WHERE product_id = $1 AND supplier_id = $2', [id, supplierId]);
+  return reply.status(204).send();
+});
+
+// ─── BONS DE COMMANDE ─────────────────────────────────────
+fastify.get('/api/purchase-orders', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { status, supplier_id } = request.query;
+  const conditions = [];
+  const params = [];
+  if (status) { conditions.push(`po.status = $${params.length + 1}`); params.push(status); }
+  if (supplier_id) { conditions.push(`po.supplier_id = $${params.length + 1}`); params.push(supplier_id); }
+  const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const result = await db.query(`
+    SELECT po.*, s.name as supplier_name, u.display_name as user_name,
+           (SELECT COUNT(*) FROM utiam_purchase_order_items WHERE purchase_order_id = po.id) as items_count
+    FROM utiam_purchase_orders po
+    JOIN utiam_suppliers s ON s.id = po.supplier_id
+    JOIN utiam_users u ON u.id = po.user_id
+    ${where}
+    ORDER BY po.created_at DESC
+  `, params);
+  return result.rows;
+});
+
+fastify.get('/api/purchase-orders/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const poRes = await db.query(`
+    SELECT po.*, s.name as supplier_name, s.phone as supplier_phone, s.email as supplier_email,
+           s.address as supplier_address, s.payment_terms, u.display_name as user_name
+    FROM utiam_purchase_orders po
+    JOIN utiam_suppliers s ON s.id = po.supplier_id
+    JOIN utiam_users u ON u.id = po.user_id
+    WHERE po.id = $1
+  `, [id]);
+  if (poRes.rows.length === 0) return reply.status(404).send({ error: 'Bon de commande introuvable' });
+
+  const items = await db.query(`
+    SELECT poi.*, p.unit FROM utiam_purchase_order_items poi
+    LEFT JOIN utiam_products p ON p.id = poi.product_id
+    WHERE poi.purchase_order_id = $1
+    ORDER BY poi.id ASC
+  `, [id]);
+
+  return { ...poRes.rows[0], items: items.rows };
+});
+
+fastify.post('/api/purchase-orders', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { supplier_id, items, expected_date, notes } = request.body;
+  const user_id = request.user.id;
+  if (!supplier_id) return reply.status(400).send({ error: 'supplier_id requis' });
+  if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun article' });
+
+  const reference = 'BC-' + Date.now();
+  const total = items.reduce((s, i) => s + (Number(i.quantity_ordered) * Number(i.unit_price || 0)), 0);
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const poRes = await client.query(
+      'INSERT INTO utiam_purchase_orders (reference, supplier_id, status, total, expected_date, notes, user_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [reference, supplier_id, 'draft', total, expected_date || null, notes || null, user_id]
+    );
+    const po = poRes.rows[0];
+
+    for (const item of items) {
+      if (!item.product_id || !item.quantity_ordered) continue;
+      // Recuperer le nom du produit
+      const prodRes = await client.query('SELECT name FROM utiam_products WHERE id = $1', [item.product_id]);
+      const productName = prodRes.rows[0]?.name || 'Produit inconnu';
+      const itemTotal = Number(item.quantity_ordered) * Number(item.unit_price || 0);
+      await client.query(
+        'INSERT INTO utiam_purchase_order_items (purchase_order_id, product_id, product_name, quantity_ordered, unit_price, total) VALUES ($1,$2,$3,$4,$5,$6)',
+        [po.id, item.product_id, productName, item.quantity_ordered, item.unit_price || null, itemTotal]
+      );
+    }
+    await client.query('COMMIT');
+    return reply.status(201).send(po);
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
+});
+
+fastify.put('/api/purchase-orders/:id/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const { status } = request.body;
+  if (!['draft', 'sent', 'received', 'partial', 'settled', 'cancelled'].includes(status)) {
+    return reply.status(400).send({ error: 'Statut invalide' });
+  }
+  // Mettre a jour la date sent_at ou received_at automatiquement
+  let extraSet = '';
+  if (status === 'sent') extraSet = ', sent_at = COALESCE(sent_at, NOW())';
+  else if (status === 'received' || status === 'partial') extraSet = ', received_at = COALESCE(received_at, NOW())';
+
+  const result = await db.query(
+    `UPDATE utiam_purchase_orders SET status = $1${extraSet} WHERE id = $2 RETURNING *`,
+    [status, id]
+  );
+  if (result.rows.length === 0) return reply.status(404).send({ error: 'BC introuvable' });
+  return result.rows[0];
+});
+
+fastify.delete('/api/purchase-orders/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  // Verifier que le BC est encore en brouillon
+  const poRes = await db.query('SELECT status FROM utiam_purchase_orders WHERE id = $1', [id]);
+  if (poRes.rows.length === 0) return reply.status(404).send({ error: 'BC introuvable' });
+  if (poRes.rows[0].status !== 'draft') {
+    return reply.status(409).send({ error: 'Seuls les brouillons peuvent etre supprimes. Utilisez "Annuler" pour les BC envoyes.' });
+  }
+  await db.query('DELETE FROM utiam_purchase_orders WHERE id = $1', [id]);
+  return reply.status(204).send();
+});
+
+// ─── PAIEMENTS FOURNISSEURS ──────────────────────────────
+fastify.get('/api/suppliers/:id/payments', { onRequest: [fastify.authenticate] }, async (request) => {
+  const result = await db.query(`
+    SELECT sp.*, u.display_name as user_name, po.reference as po_reference
+    FROM utiam_supplier_payments sp
+    JOIN utiam_users u ON u.id = sp.user_id
+    LEFT JOIN utiam_purchase_orders po ON po.id = sp.purchase_order_id
+    WHERE sp.supplier_id = $1
+    ORDER BY sp.created_at DESC
+  `, [request.params.id]);
+  return result.rows;
+});
+
+fastify.post('/api/supplier-payments', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { supplier_id, purchase_order_id, amount, payment_method, reference, notes } = request.body;
+  const user_id = request.user.id;
+  if (!supplier_id || !amount || !payment_method) return reply.status(400).send({ error: 'supplier_id, amount, payment_method requis' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      'INSERT INTO utiam_supplier_payments (supplier_id, purchase_order_id, amount, payment_method, reference, notes, user_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [supplier_id, purchase_order_id || null, Number(amount), payment_method, reference || null, notes || null, user_id]
+    );
+
+    // Si paiement lie a un BC : verifier si solde total
+    if (purchase_order_id) {
+      const poRes = await client.query('SELECT total FROM utiam_purchase_orders WHERE id = $1', [purchase_order_id]);
+      const totalPaidRes = await client.query('SELECT COALESCE(SUM(amount), 0) as total FROM utiam_supplier_payments WHERE purchase_order_id = $1', [purchase_order_id]);
+      if (poRes.rows.length > 0) {
+        const total = Number(poRes.rows[0].total);
+        const paid = Number(totalPaidRes.rows[0].total);
+        if (paid >= total) {
+          await client.query("UPDATE utiam_purchase_orders SET status = 'settled' WHERE id = $1 AND status = 'received'", [purchase_order_id]);
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+    return reply.status(201).send(result.rows[0]);
+  } catch (err) { await client.query('ROLLBACK'); throw err; }
+  finally { client.release(); }
+});
+
+
 // ─── CLIENTS ──────────────────────────────────────────────
 fastify.get('/api/clients', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query(`
@@ -406,23 +754,67 @@ fastify.post('/api/stock/movements', { onRequest: [fastify.authenticate] }, asyn
   finally { client.release(); }
 });
 
+// Bon de reception ameliore : accepte supplier_id et purchase_order_id
 fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-  const { items, reason, supplier } = request.body;
+  const { items, reason, supplier_id, purchase_order_id } = request.body;
   const user_id = request.user.id;
   if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun produit a receptionner' });
+
   const batch_ref = 'BR-' + Date.now();
-  const note = supplier ? `Fournisseur: ${supplier}${reason ? ' - ' + reason : ''}` : (reason || null);
+  // Construire la note avec le nom du fournisseur
+  let supplierName = null;
+  if (supplier_id) {
+    const supRes = await db.query('SELECT name FROM utiam_suppliers WHERE id = $1', [supplier_id]);
+    if (supRes.rows.length > 0) supplierName = supRes.rows[0].name;
+  }
+  const note = supplierName ? `Fournisseur: ${supplierName}${reason ? ' - ' + reason : ''}` : (reason || null);
+
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     for (const item of items) {
       if (!item.product_id || !item.quantity || Number(item.quantity) <= 0) continue;
       await client.query(
-        'INSERT INTO utiam_stock_movements (product_id, type, quantity, reason, unit_price, batch_ref, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [item.product_id, 'delivery', Math.abs(item.quantity), note, item.unit_price || null, batch_ref, user_id]
+        'INSERT INTO utiam_stock_movements (product_id, type, quantity, reason, unit_price, batch_ref, purchase_order_id, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+        [item.product_id, 'delivery', Math.abs(item.quantity), note, item.unit_price || null, batch_ref, purchase_order_id || null, user_id]
       );
       await client.query('UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [Math.abs(item.quantity), item.product_id]);
+
+      // Mettre a jour le prix d'achat du produit chez le fournisseur si fourni
+      if (supplier_id && item.unit_price) {
+        const existing = await client.query('SELECT id FROM utiam_product_suppliers WHERE product_id = $1 AND supplier_id = $2', [item.product_id, supplier_id]);
+        if (existing.rows.length > 0) {
+          await client.query('UPDATE utiam_product_suppliers SET unit_price = $1 WHERE id = $2', [item.unit_price, existing.rows[0].id]);
+        } else {
+          await client.query('INSERT INTO utiam_product_suppliers (product_id, supplier_id, unit_price) VALUES ($1, $2, $3)', [item.product_id, supplier_id, item.unit_price]);
+        }
+      }
+
+      // Mettre a jour les quantites recues du BC
+      if (purchase_order_id) {
+        await client.query(
+          'UPDATE utiam_purchase_order_items SET quantity_received = quantity_received + $1 WHERE purchase_order_id = $2 AND product_id = $3',
+          [Math.abs(item.quantity), purchase_order_id, item.product_id]
+        );
+      }
     }
+
+    // Si le BC est marque, verifier s'il est entierement recu
+    if (purchase_order_id) {
+      const itemsCheck = await client.query(
+        'SELECT SUM(quantity_ordered) as ordered, SUM(quantity_received) as received FROM utiam_purchase_order_items WHERE purchase_order_id = $1',
+        [purchase_order_id]
+      );
+      const ordered = Number(itemsCheck.rows[0].ordered);
+      const received = Number(itemsCheck.rows[0].received);
+      let newStatus;
+      if (received >= ordered) newStatus = 'received';
+      else if (received > 0) newStatus = 'partial';
+      if (newStatus) {
+        await client.query("UPDATE utiam_purchase_orders SET status = $1, received_at = COALESCE(received_at, NOW()) WHERE id = $2", [newStatus, purchase_order_id]);
+      }
+    }
+
     await client.query('COMMIT');
     return reply.status(201).send({ success: true, batch_ref, count: items.length });
   } catch (err) { await client.query('ROLLBACK'); throw err; }
@@ -507,12 +899,7 @@ fastify.get('/api/reports/stock-value', { onRequest: [fastify.authenticate] }, a
   };
 });
 
-
-// ═════════════════════════════════════════════════════════
 // ─── UTILISATEURS ─────────────────────────────────────────
-// ═════════════════════════════════════════════════════════
-
-// Liste avec stats (nb ventes par caissier)
 fastify.get('/api/users', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query(`
     SELECT u.id, u.email, u.display_name, u.role, u.is_active, u.must_change_password, u.created_at,
@@ -529,23 +916,16 @@ fastify.get('/api/users', { onRequest: [fastify.authenticate] }, async () => {
   return result.rows;
 });
 
-// Creation d'un utilisateur (admin only)
 fastify.post('/api/users', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   if (request.user.role !== 'admin') return reply.status(403).send({ error: 'Seul un administrateur peut creer des utilisateurs' });
-
   const { email, password, display_name, role } = request.body;
   if (!email || !password || !display_name) return reply.status(400).send({ error: 'Email, mot de passe et nom obligatoires' });
   if (!['admin', 'gerant', 'caissier'].includes(role)) return reply.status(400).send({ error: 'Role invalide' });
-
   const pwdErr = validatePasswordStrength(password);
   if (pwdErr) return reply.status(400).send({ error: pwdErr });
-
-  // Verifier email unique
   const existing = await db.query('SELECT id FROM utiam_users WHERE email = $1', [email]);
   if (existing.rows.length > 0) return reply.status(409).send({ error: 'Cet email est deja utilise' });
-
   const hash = await bcrypt.hash(password, 10);
-  // must_change_password = TRUE : l'utilisateur devra changer son MdP au 1er login
   const result = await db.query(
     'INSERT INTO utiam_users (email, password_hash, display_name, role, must_change_password) VALUES ($1, $2, $3, $4, TRUE) RETURNING id, email, display_name, role, is_active, must_change_password',
     [email, hash, display_name, role]
@@ -553,16 +933,12 @@ fastify.post('/api/users', { onRequest: [fastify.authenticate] }, async (request
   return reply.status(201).send(result.rows[0]);
 });
 
-// Modification d'un utilisateur (admin only)
 fastify.put('/api/users/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   if (request.user.role !== 'admin') return reply.status(403).send({ error: 'Seul un administrateur peut modifier les utilisateurs' });
-
   const { id } = request.params;
   const { email, display_name, role } = request.body;
   if (!email || !display_name) return reply.status(400).send({ error: 'Email et nom obligatoires' });
   if (!['admin', 'gerant', 'caissier'].includes(role)) return reply.status(400).send({ error: 'Role invalide' });
-
-  // Verifier que ce n'est pas le seul admin qu'on retrograde
   if (role !== 'admin') {
     const userCheck = await db.query('SELECT role FROM utiam_users WHERE id = $1', [id]);
     if (userCheck.rows.length > 0 && userCheck.rows[0].role === 'admin') {
@@ -572,34 +948,19 @@ fastify.put('/api/users/:id', { onRequest: [fastify.authenticate] }, async (requ
       }
     }
   }
-
-  // Verifier email unique (autre que l'utilisateur courant)
   const existing = await db.query('SELECT id FROM utiam_users WHERE email = $1 AND id != $2', [email, id]);
   if (existing.rows.length > 0) return reply.status(409).send({ error: 'Cet email est deja utilise' });
-
-  const result = await db.query(
-    'UPDATE utiam_users SET email = $1, display_name = $2, role = $3 WHERE id = $4 RETURNING id, email, display_name, role, is_active',
-    [email, display_name, role, id]
-  );
+  const result = await db.query('UPDATE utiam_users SET email = $1, display_name = $2, role = $3 WHERE id = $4 RETURNING id, email, display_name, role, is_active', [email, display_name, role, id]);
   if (result.rows.length === 0) return reply.status(404).send({ error: 'Utilisateur introuvable' });
   return result.rows[0];
 });
 
-// Activation / Desactivation (admin only)
 fastify.put('/api/users/:id/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   if (request.user.role !== 'admin') return reply.status(403).send({ error: 'Seul un administrateur peut modifier le statut des utilisateurs' });
-
   const { id } = request.params;
   const { is_active } = request.body;
-
   if (typeof is_active !== 'boolean') return reply.status(400).send({ error: 'is_active doit etre un booleen' });
-
-  // Empecher de se desactiver soi-meme
-  if (parseInt(id) === request.user.id && !is_active) {
-    return reply.status(409).send({ error: 'Vous ne pouvez pas desactiver votre propre compte' });
-  }
-
-  // Empecher de desactiver le dernier admin actif
+  if (parseInt(id) === request.user.id && !is_active) return reply.status(409).send({ error: 'Vous ne pouvez pas desactiver votre propre compte' });
   if (!is_active) {
     const userCheck = await db.query('SELECT role FROM utiam_users WHERE id = $1', [id]);
     if (userCheck.rows.length > 0 && userCheck.rows[0].role === 'admin') {
@@ -609,63 +970,40 @@ fastify.put('/api/users/:id/status', { onRequest: [fastify.authenticate] }, asyn
       }
     }
   }
-
-  const result = await db.query(
-    'UPDATE utiam_users SET is_active = $1 WHERE id = $2 RETURNING id, email, display_name, role, is_active',
-    [is_active, id]
-  );
+  const result = await db.query('UPDATE utiam_users SET is_active = $1 WHERE id = $2 RETURNING id, email, display_name, role, is_active', [is_active, id]);
   if (result.rows.length === 0) return reply.status(404).send({ error: 'Utilisateur introuvable' });
   return result.rows[0];
 });
 
-// Reinitialisation du mot de passe par l'admin
 fastify.post('/api/users/:id/reset-password', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   if (request.user.role !== 'admin') return reply.status(403).send({ error: 'Seul un administrateur peut reinitialiser les mots de passe' });
-
   const { id } = request.params;
   const { new_password } = request.body;
-
   const pwdErr = validatePasswordStrength(new_password);
   if (pwdErr) return reply.status(400).send({ error: pwdErr });
-
   const hash = await bcrypt.hash(new_password, 10);
-  // must_change_password = TRUE : forcer l'utilisateur a changer au prochain login
-  const result = await db.query(
-    'UPDATE utiam_users SET password_hash = $1, must_change_password = TRUE WHERE id = $2 RETURNING id',
-    [hash, id]
-  );
+  const result = await db.query('UPDATE utiam_users SET password_hash = $1, must_change_password = TRUE WHERE id = $2 RETURNING id', [hash, id]);
   if (result.rows.length === 0) return reply.status(404).send({ error: 'Utilisateur introuvable' });
   return { success: true };
 });
 
-// Changer son propre mot de passe (tout utilisateur connecte)
 fastify.put('/api/users/me/password', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { current_password, new_password } = request.body;
   if (!new_password) return reply.status(400).send({ error: 'Nouveau mot de passe requis' });
-
   const pwdErr = validatePasswordStrength(new_password);
   if (pwdErr) return reply.status(400).send({ error: pwdErr });
-
-  // Recuperer le hash actuel
   const userRes = await db.query('SELECT password_hash, must_change_password FROM utiam_users WHERE id = $1', [request.user.id]);
   if (userRes.rows.length === 0) return reply.status(404).send({ error: 'Utilisateur introuvable' });
-
   const user = userRes.rows[0];
-
-  // Si pas en mode "forcer changement", verifier le mot de passe actuel
   if (!user.must_change_password) {
     if (!current_password) return reply.status(400).send({ error: 'Mot de passe actuel requis' });
     const valid = await bcrypt.compare(current_password, user.password_hash);
     if (!valid) return reply.status(401).send({ error: 'Mot de passe actuel incorrect' });
   }
-
-  // Empecher de mettre le meme mot de passe
   const same = await bcrypt.compare(new_password, user.password_hash);
   if (same) return reply.status(400).send({ error: 'Le nouveau mot de passe doit etre different de l\'ancien' });
-
   const newHash = await bcrypt.hash(new_password, 10);
   await db.query('UPDATE utiam_users SET password_hash = $1, must_change_password = FALSE WHERE id = $2', [newHash, request.user.id]);
-
   return { success: true };
 });
 
