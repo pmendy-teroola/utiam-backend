@@ -80,7 +80,6 @@ fastify.get('/api/products', { onRequest: [fastify.authenticate] }, async (reque
   else if (status === 'archived')  whereStatus = "p.status = 'archived'";
   else if (status === 'all')       whereStatus = "TRUE";
 
-  // Filtre par fournisseur (optionnel)
   let supplierJoin = '';
   let supplierWhere = '';
   const params = [];
@@ -278,8 +277,8 @@ fastify.get('/api/suppliers', { onRequest: [fastify.authenticate] }, async (requ
   const result = await db.query(`
     SELECT s.*,
            COALESCE(stats.products_count, 0) as products_count,
-           COALESCE(stats.total_received, 0) as total_received,
-           stats.last_delivery,
+           COALESCE(pos.total_received, 0) as total_received,
+           pos.last_delivery,
            COALESCE(pos.po_count, 0) as po_count,
            COALESCE(pos.po_total, 0) as po_total,
            COALESCE(payments.total_paid, 0) as total_paid
@@ -312,7 +311,6 @@ fastify.get('/api/suppliers/:id', { onRequest: [fastify.authenticate] }, async (
   const supplierRes = await db.query('SELECT * FROM utiam_suppliers WHERE id = $1', [id]);
   if (supplierRes.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
 
-  // Stats
   const products = await db.query(`
     SELECT ps.*, p.name as product_name, p.unit, p.stock
     FROM utiam_product_suppliers ps
@@ -339,7 +337,6 @@ fastify.get('/api/suppliers/:id', { onRequest: [fastify.authenticate] }, async (
     ORDER BY sp.created_at DESC LIMIT 50
   `, [id]);
 
-  // Calcul du solde du
   const balanceRes = await db.query(`
     SELECT
       COALESCE((SELECT SUM(total) FROM utiam_purchase_orders WHERE supplier_id = $1 AND status IN ('received', 'settled')), 0) as total_received,
@@ -408,11 +405,9 @@ fastify.post('/api/products/:id/suppliers', { onRequest: [fastify.authenticate] 
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    // Si is_primary = true, retirer le flag des autres
     if (is_primary) {
       await client.query('UPDATE utiam_product_suppliers SET is_primary = FALSE WHERE product_id = $1', [id]);
     }
-    // Verifier si la liaison existe deja
     const existing = await client.query('SELECT id FROM utiam_product_suppliers WHERE product_id = $1 AND supplier_id = $2', [id, supplier_id]);
     let result;
     if (existing.rows.length > 0) {
@@ -514,7 +509,6 @@ fastify.post('/api/purchase-orders', { onRequest: [fastify.authenticate] }, asyn
 
     for (const item of items) {
       if (!item.product_id || !item.quantity_ordered) continue;
-      // Recuperer le nom du produit
       const prodRes = await client.query('SELECT name FROM utiam_products WHERE id = $1', [item.product_id]);
       const productName = prodRes.rows[0]?.name || 'Produit inconnu';
       const itemTotal = Number(item.quantity_ordered) * Number(item.unit_price || 0);
@@ -535,7 +529,6 @@ fastify.put('/api/purchase-orders/:id/status', { onRequest: [fastify.authenticat
   if (!['draft', 'sent', 'received', 'partial', 'settled', 'cancelled'].includes(status)) {
     return reply.status(400).send({ error: 'Statut invalide' });
   }
-  // Mettre a jour la date sent_at ou received_at automatiquement
   let extraSet = '';
   if (status === 'sent') extraSet = ', sent_at = COALESCE(sent_at, NOW())';
   else if (status === 'received' || status === 'partial') extraSet = ', received_at = COALESCE(received_at, NOW())';
@@ -550,7 +543,6 @@ fastify.put('/api/purchase-orders/:id/status', { onRequest: [fastify.authenticat
 
 fastify.delete('/api/purchase-orders/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { id } = request.params;
-  // Verifier que le BC est encore en brouillon
   const poRes = await db.query('SELECT status FROM utiam_purchase_orders WHERE id = $1', [id]);
   if (poRes.rows.length === 0) return reply.status(404).send({ error: 'BC introuvable' });
   if (poRes.rows[0].status !== 'draft') {
@@ -586,7 +578,6 @@ fastify.post('/api/supplier-payments', { onRequest: [fastify.authenticate] }, as
       [supplier_id, purchase_order_id || null, Number(amount), payment_method, reference || null, notes || null, user_id]
     );
 
-    // Si paiement lie a un BC : verifier si solde total
     if (purchase_order_id) {
       const poRes = await client.query('SELECT total FROM utiam_purchase_orders WHERE id = $1', [purchase_order_id]);
       const totalPaidRes = await client.query('SELECT COALESCE(SUM(amount), 0) as total FROM utiam_supplier_payments WHERE purchase_order_id = $1', [purchase_order_id]);
@@ -761,7 +752,6 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
   if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun produit a receptionner' });
 
   const batch_ref = 'BR-' + Date.now();
-  // Construire la note avec le nom du fournisseur
   let supplierName = null;
   if (supplier_id) {
     const supRes = await db.query('SELECT name FROM utiam_suppliers WHERE id = $1', [supplier_id]);
@@ -780,7 +770,6 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
       );
       await client.query('UPDATE utiam_products SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [Math.abs(item.quantity), item.product_id]);
 
-      // Mettre a jour le prix d'achat du produit chez le fournisseur si fourni
       if (supplier_id && item.unit_price) {
         const existing = await client.query('SELECT id FROM utiam_product_suppliers WHERE product_id = $1 AND supplier_id = $2', [item.product_id, supplier_id]);
         if (existing.rows.length > 0) {
@@ -790,7 +779,6 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
         }
       }
 
-      // Mettre a jour les quantites recues du BC
       if (purchase_order_id) {
         await client.query(
           'UPDATE utiam_purchase_order_items SET quantity_received = quantity_received + $1 WHERE purchase_order_id = $2 AND product_id = $3',
@@ -799,7 +787,6 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
       }
     }
 
-    // Si le BC est marque, verifier s'il est entierement recu
     if (purchase_order_id) {
       const itemsCheck = await client.query(
         'SELECT SUM(quantity_ordered) as ordered, SUM(quantity_received) as received FROM utiam_purchase_order_items WHERE purchase_order_id = $1',
