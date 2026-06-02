@@ -22,41 +22,27 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-// Plugins
 fastify.register(require('@fastify/cors'), { origin: true });
-fastify.register(require('@fastify/jwt'), {
-  secret: process.env.JWT_SECRET || 'utiam_secret_key'
-});
-fastify.register(require('@fastify/multipart'), {
-  limits: { fileSize: 10 * 1024 * 1024 }
-});
-fastify.register(require('@fastify/static'), {
-  root: UPLOAD_DIR,
-  prefix: '/uploads/products/',
-});
+fastify.register(require('@fastify/jwt'), { secret: process.env.JWT_SECRET || 'utiam_secret_key' });
+fastify.register(require('@fastify/multipart'), { limits: { fileSize: 10 * 1024 * 1024 } });
+fastify.register(require('@fastify/static'), { root: UPLOAD_DIR, prefix: '/uploads/products/' });
 
 fastify.decorate('authenticate', async function(request, reply) {
   try { await request.jwtVerify(); }
   catch (err) { reply.status(401).send({ error: 'Non autorise' }); }
 });
 
-// ─── HEALTH ───────────────────────────────────────────────
 fastify.get('/health', async () => ({ status: 'ok', app: 'U TIAM' }));
 
 // ─── AUTH ─────────────────────────────────────────────────
 fastify.post('/api/auth/login', async (request, reply) => {
   const { email, password } = request.body;
-  const result = await db.query(
-    'SELECT * FROM utiam_users WHERE email = $1 AND is_active = true',
-    [email]
-  );
+  const result = await db.query('SELECT * FROM utiam_users WHERE email = $1 AND is_active = true', [email]);
   if (result.rows.length === 0) return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
   const user = result.rows[0];
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return reply.status(401).send({ error: 'Email ou mot de passe incorrect' });
-  const token = fastify.jwt.sign({
-    id: user.id, email: user.email, role: user.role, display_name: user.display_name
-  }, { expiresIn: '24h' });
+  const token = fastify.jwt.sign({ id: user.id, email: user.email, role: user.role, display_name: user.display_name }, { expiresIn: '24h' });
   return { token, user: { id: user.id, email: user.email, role: user.role, display_name: user.display_name } };
 });
 
@@ -117,9 +103,7 @@ fastify.put('/api/products/:id', { onRequest: [fastify.authenticate] }, async (r
 
 fastify.put('/api/products/:id/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { status } = request.body;
-  if (!['active', 'inactive', 'archived'].includes(status)) {
-    return reply.status(400).send({ error: 'Statut invalide' });
-  }
+  if (!['active', 'inactive', 'archived'].includes(status)) return reply.status(400).send({ error: 'Statut invalide' });
   const result = await db.query('UPDATE utiam_products SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, request.params.id]);
   return result.rows[0];
 });
@@ -128,7 +112,6 @@ fastify.delete('/api/products/:id', { onRequest: [fastify.authenticate] }, async
   await db.query('DELETE FROM utiam_products WHERE id = $1', [request.params.id]);
   return reply.status(204).send();
 });
-
 
 // ─── IMPORT CSV ───────────────────────────────────────────
 fastify.post('/api/products/import', { onRequest: [fastify.authenticate] }, async (request, reply) => {
@@ -202,7 +185,6 @@ fastify.post('/api/products/check-duplicates', { onRequest: [fastify.authenticat
   return map;
 });
 
-
 // ─── IMAGES PRODUITS ──────────────────────────────────────
 fastify.get('/api/products/:id/images', { onRequest: [fastify.authenticate] }, async (request) => {
   const result = await db.query('SELECT * FROM utiam_product_images WHERE product_id = $1 ORDER BY is_primary DESC, position ASC, id ASC', [request.params.id]);
@@ -263,24 +245,100 @@ fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, as
 });
 
 
+// ═════════════════════════════════════════════════════════
 // ─── CLIENTS ──────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════
+
+// Liste enrichie avec stats par client
 fastify.get('/api/clients', { onRequest: [fastify.authenticate] }, async () => {
-  const result = await db.query('SELECT * FROM utiam_clients ORDER BY name');
+  const result = await db.query(`
+    SELECT c.*,
+           COALESCE(stats.visits, 0) as visits,
+           COALESCE(stats.total_spent, 0) as total_spent,
+           stats.last_visit
+    FROM utiam_clients c
+    LEFT JOIN (
+      SELECT client_id,
+             COUNT(*) as visits,
+             SUM(total) as total_spent,
+             MAX(created_at) as last_visit
+      FROM utiam_sales
+      WHERE client_id IS NOT NULL
+      GROUP BY client_id
+    ) stats ON stats.client_id = c.id
+    ORDER BY c.name
+  `);
   return result.rows;
 });
+
+// Detail d'un client + historique complet
+fastify.get('/api/clients/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const clientRes = await db.query('SELECT * FROM utiam_clients WHERE id = $1', [id]);
+  if (clientRes.rows.length === 0) return reply.status(404).send({ error: 'Client introuvable' });
+  const stats = await db.query(`
+    SELECT COUNT(*) as visits, COALESCE(SUM(total), 0) as total_spent, COALESCE(AVG(total), 0) as avg_basket,
+           MAX(created_at) as last_visit, MIN(created_at) as first_visit
+    FROM utiam_sales WHERE client_id = $1
+  `, [id]);
+  return { ...clientRes.rows[0], stats: stats.rows[0] };
+});
+
+// Historique d'achats d'un client
+fastify.get('/api/clients/:id/history', { onRequest: [fastify.authenticate] }, async (request) => {
+  const { id } = request.params;
+  const sales = await db.query(`
+    SELECT s.*, u.display_name as cashier_name,
+           json_agg(json_build_object(
+             'product_name', si.product_name,
+             'quantity', si.quantity,
+             'price', si.price,
+             'total', si.total
+           )) as items
+    FROM utiam_sales s
+    LEFT JOIN utiam_users u ON s.cashier_id = u.id
+    LEFT JOIN utiam_sale_items si ON si.sale_id = s.id
+    WHERE s.client_id = $1
+    GROUP BY s.id, u.display_name
+    ORDER BY s.created_at DESC
+    LIMIT 100
+  `, [id]);
+  return sales.rows;
+});
+
 fastify.post('/api/clients', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { name, phone, email } = request.body;
-  const result = await db.query('INSERT INTO utiam_clients (name, phone, email) VALUES ($1,$2,$3) RETURNING *', [name, phone || null, email || null]);
+  if (!name || !String(name).trim()) return reply.status(400).send({ error: 'Le nom est obligatoire' });
+  const result = await db.query(
+    'INSERT INTO utiam_clients (name, phone, email) VALUES ($1,$2,$3) RETURNING *',
+    [String(name).trim(), phone || null, email || null]
+  );
   return reply.status(201).send(result.rows[0]);
 });
+
 fastify.put('/api/clients/:id', { onRequest: [fastify.authenticate] }, async (request) => {
   const { name, phone, email, credit, loyalty_points } = request.body;
   const result = await db.query(
-    'UPDATE utiam_clients SET name=$1, phone=$2, email=$3, credit=$4, loyalty_points=$5 WHERE id=$6 RETURNING *',
-    [name, phone, email, credit, loyalty_points, request.params.id]
+    'UPDATE utiam_clients SET name=$1, phone=$2, email=$3, credit=COALESCE($4, credit), loyalty_points=COALESCE($5, loyalty_points) WHERE id=$6 RETURNING *',
+    [name, phone || null, email || null, credit ?? null, loyalty_points ?? null, request.params.id]
   );
   return result.rows[0];
 });
+
+// Suppression avec verification des ventes liees
+fastify.delete('/api/clients/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const salesCheck = await db.query('SELECT COUNT(*) as cnt FROM utiam_sales WHERE client_id = $1', [id]);
+  if (parseInt(salesCheck.rows[0].cnt) > 0) {
+    return reply.status(409).send({
+      error: 'Ce client a ' + salesCheck.rows[0].cnt + ' vente(s) associee(s). Impossible de le supprimer.',
+      sales_count: parseInt(salesCheck.rows[0].cnt)
+    });
+  }
+  await db.query('DELETE FROM utiam_clients WHERE id = $1', [id]);
+  return reply.status(204).send();
+});
+
 
 // ─── VENTES ───────────────────────────────────────────────
 fastify.get('/api/sales', { onRequest: [fastify.authenticate] }, async (request) => {
@@ -436,89 +494,56 @@ fastify.get('/api/stock/summary', { onRequest: [fastify.authenticate] }, async (
 });
 
 
-// ═════════════════════════════════════════════════════════
 // ─── RAPPORTS ─────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════
-
-// Rapport complet pour la periode demandee
-// Query : ?from=YYYY-MM-DD ?to=YYYY-MM-DD (defaut : mois en cours)
 fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async (request) => {
   const { from, to } = request.query;
   const dateFrom = from || new Date(new Date().setDate(1)).toISOString().split('T')[0];
   const dateTo = to || new Date().toISOString().split('T')[0];
 
-  // 1. CA total + nombre de ventes + panier moyen
   const revenue = await db.query(
-    `SELECT
-       COALESCE(SUM(total), 0) as total,
-       COUNT(*) as count,
-       COALESCE(AVG(total), 0) as avg_basket
-     FROM utiam_sales
-     WHERE created_at::date BETWEEN $1 AND $2`,
+    `SELECT COALESCE(SUM(total), 0) as total, COUNT(*) as count, COALESCE(AVG(total), 0) as avg_basket
+     FROM utiam_sales WHERE created_at::date BETWEEN $1 AND $2`,
     [dateFrom, dateTo]
   );
-
-  // 2. Top 10 produits vendus
   const topProducts = await db.query(
     `SELECT p.name, SUM(si.quantity) as qty, SUM(si.total) as revenue
      FROM utiam_sale_items si
      JOIN utiam_products p ON si.product_id = p.id
      JOIN utiam_sales s ON si.sale_id = s.id
      WHERE s.created_at::date BETWEEN $1 AND $2
-     GROUP BY p.name
-     ORDER BY qty DESC
-     LIMIT 10`,
+     GROUP BY p.name ORDER BY qty DESC LIMIT 10`,
     [dateFrom, dateTo]
   );
-
-  // 3. Top 10 clients (CA)
   const topClients = await db.query(
     `SELECT c.id, c.name, c.phone, COUNT(s.id) as visits, SUM(s.total) as revenue
      FROM utiam_sales s
      JOIN utiam_clients c ON s.client_id = c.id
      WHERE s.created_at::date BETWEEN $1 AND $2 AND s.client_id IS NOT NULL
-     GROUP BY c.id, c.name, c.phone
-     ORDER BY revenue DESC
-     LIMIT 10`,
+     GROUP BY c.id, c.name, c.phone ORDER BY revenue DESC LIMIT 10`,
     [dateFrom, dateTo]
   );
-
-  // 4. Ventilation par mode de paiement
   const paymentMethods = await db.query(
     `SELECT payment_method, COUNT(*) as count, SUM(total) as total
-     FROM utiam_sales
-     WHERE created_at::date BETWEEN $1 AND $2
-     GROUP BY payment_method
-     ORDER BY total DESC`,
+     FROM utiam_sales WHERE created_at::date BETWEEN $1 AND $2
+     GROUP BY payment_method ORDER BY total DESC`,
     [dateFrom, dateTo]
   );
-
-  // 5. CA par tranche horaire (24 tranches)
   const hourlySales = await db.query(
     `SELECT EXTRACT(HOUR FROM created_at)::int as hour, COUNT(*) as count, SUM(total) as total
-     FROM utiam_sales
-     WHERE created_at::date BETWEEN $1 AND $2
-     GROUP BY EXTRACT(HOUR FROM created_at)
-     ORDER BY hour ASC`,
+     FROM utiam_sales WHERE created_at::date BETWEEN $1 AND $2
+     GROUP BY EXTRACT(HOUR FROM created_at) ORDER BY hour ASC`,
     [dateFrom, dateTo]
   );
-
-  // 6. CA par caissier
   const cashiers = await db.query(
     `SELECT u.id, u.display_name, u.role, COUNT(s.id) as count, SUM(s.total) as total, AVG(s.total) as avg_basket
      FROM utiam_sales s
      JOIN utiam_users u ON s.cashier_id = u.id
      WHERE s.created_at::date BETWEEN $1 AND $2
-     GROUP BY u.id, u.display_name, u.role
-     ORDER BY total DESC`,
+     GROUP BY u.id, u.display_name, u.role ORDER BY total DESC`,
     [dateFrom, dateTo]
   );
-
-  // 7. Marge brute estimee (CA - cout des marchandises vendues)
   const marginResult = await db.query(
-    `SELECT
-       COALESCE(SUM(si.total), 0) as revenue,
-       COALESCE(SUM(si.quantity * COALESCE(p.buy_price, 0)), 0) as cost
+    `SELECT COALESCE(SUM(si.total), 0) as revenue, COALESCE(SUM(si.quantity * COALESCE(p.buy_price, 0)), 0) as cost
      FROM utiam_sale_items si
      JOIN utiam_products p ON si.product_id = p.id
      JOIN utiam_sales s ON si.sale_id = s.id
@@ -529,26 +554,14 @@ fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async
     revenue: Number(marginResult.rows[0].revenue),
     cost: Number(marginResult.rows[0].cost),
     gross: Number(marginResult.rows[0].revenue) - Number(marginResult.rows[0].cost),
-    rate: Number(marginResult.rows[0].revenue) > 0
-      ? ((Number(marginResult.rows[0].revenue) - Number(marginResult.rows[0].cost)) / Number(marginResult.rows[0].revenue)) * 100
-      : 0,
+    rate: Number(marginResult.rows[0].revenue) > 0 ? ((Number(marginResult.rows[0].revenue) - Number(marginResult.rows[0].cost)) / Number(marginResult.rows[0].revenue)) * 100 : 0,
   };
-
-  // 8. Alertes stock
-  const lowStock = await db.query(
-    "SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock AND status = 'active' ORDER BY stock ASC LIMIT 20"
-  );
-  const outOfStock = await db.query(
-    "SELECT name, barcode FROM utiam_products WHERE stock = 0 AND status = 'active' ORDER BY name LIMIT 20"
-  );
+  const lowStock = await db.query("SELECT name, stock, min_stock FROM utiam_products WHERE stock <= min_stock AND status = 'active' ORDER BY stock ASC LIMIT 20");
+  const outOfStock = await db.query("SELECT name, barcode FROM utiam_products WHERE stock = 0 AND status = 'active' ORDER BY name LIMIT 20");
 
   return {
     period: { from: dateFrom, to: dateTo },
-    revenue: {
-      total: Number(revenue.rows[0].total),
-      count: Number(revenue.rows[0].count),
-      avg_basket: Number(revenue.rows[0].avg_basket),
-    },
+    revenue: { total: Number(revenue.rows[0].total), count: Number(revenue.rows[0].count), avg_basket: Number(revenue.rows[0].avg_basket) },
     top_products: topProducts.rows,
     top_clients: topClients.rows,
     payment_methods: paymentMethods.rows,
@@ -560,16 +573,12 @@ fastify.get('/api/reports/summary', { onRequest: [fastify.authenticate] }, async
   };
 });
 
-// Valeur du stock actuel (a prix achat et a prix vente)
 fastify.get('/api/reports/stock-value', { onRequest: [fastify.authenticate] }, async () => {
   const result = await db.query(
-    `SELECT
-       COUNT(*) as product_count,
-       COALESCE(SUM(stock), 0) as total_units,
-       COALESCE(SUM(stock * COALESCE(buy_price, 0)), 0) as value_buy,
-       COALESCE(SUM(stock * sell_price), 0) as value_sell
-     FROM utiam_products
-     WHERE status = 'active' AND stock > 0`
+    `SELECT COUNT(*) as product_count, COALESCE(SUM(stock), 0) as total_units,
+            COALESCE(SUM(stock * COALESCE(buy_price, 0)), 0) as value_buy,
+            COALESCE(SUM(stock * sell_price), 0) as value_sell
+     FROM utiam_products WHERE status = 'active' AND stock > 0`
   );
   const row = result.rows[0];
   return {
