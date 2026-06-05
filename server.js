@@ -6,6 +6,7 @@ const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const PDFDocument = require('pdfkit');
 
 const db = new Pool({
   host: process.env.DB_HOST || 'kaniene_postgres',
@@ -268,11 +269,14 @@ fastify.delete('/api/images/:imageId', { onRequest: [fastify.authenticate] }, as
 // ═════════════════════════════════════════════════════════
 
 // Liste des fournisseurs avec stats
+// ?active=true : actifs uniquement (defaut quand pas precise)
+// ?active=false : inactifs uniquement
+// ?active=all : tous
 fastify.get('/api/suppliers', { onRequest: [fastify.authenticate] }, async (request) => {
   const { active } = request.query;
-  let whereActive = '';
-  if (active === 'true') whereActive = 'WHERE s.is_active = TRUE';
-  else if (active === 'false') whereActive = 'WHERE s.is_active = FALSE';
+  let whereActive = 'WHERE s.is_active = TRUE';  // defaut : actifs
+  if (active === 'false') whereActive = 'WHERE s.is_active = FALSE';
+  else if (active === 'all') whereActive = '';
 
   const result = await db.query(`
     SELECT s.*,
@@ -305,7 +309,6 @@ fastify.get('/api/suppliers', { onRequest: [fastify.authenticate] }, async (requ
   return result.rows;
 });
 
-// Detail d'un fournisseur
 fastify.get('/api/suppliers/:id', { onRequest: [fastify.authenticate] }, async (request, reply) => {
   const { id } = request.params;
   const supplierRes = await db.query('SELECT * FROM utiam_suppliers WHERE id = $1', [id]);
@@ -388,7 +391,7 @@ fastify.put('/api/suppliers/:id/status', { onRequest: [fastify.authenticate] }, 
 // ─── PRODUIT <-> FOURNISSEURS ────────────────────────────
 fastify.get('/api/products/:id/suppliers', { onRequest: [fastify.authenticate] }, async (request) => {
   const result = await db.query(`
-    SELECT ps.*, s.name as supplier_name, s.phone, s.email
+    SELECT ps.*, s.name as supplier_name, s.phone, s.email, s.is_active
     FROM utiam_product_suppliers ps
     JOIN utiam_suppliers s ON s.id = ps.supplier_id
     WHERE ps.product_id = $1
@@ -401,6 +404,11 @@ fastify.post('/api/products/:id/suppliers', { onRequest: [fastify.authenticate] 
   const { id } = request.params;
   const { supplier_id, unit_price, is_primary, notes } = request.body;
   if (!supplier_id) return reply.status(400).send({ error: 'supplier_id requis' });
+
+  // Verifier que le fournisseur est actif
+  const supCheck = await db.query('SELECT is_active FROM utiam_suppliers WHERE id = $1', [supplier_id]);
+  if (supCheck.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
+  if (!supCheck.rows[0].is_active) return reply.status(409).send({ error: 'Ce fournisseur est desactive. Reactivez-le avant de l\'utiliser.' });
 
   const client = await db.connect();
   try {
@@ -495,6 +503,17 @@ fastify.post('/api/purchase-orders', { onRequest: [fastify.authenticate] }, asyn
   if (!supplier_id) return reply.status(400).send({ error: 'supplier_id requis' });
   if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun article' });
 
+  // Verifier que le fournisseur est actif
+  const supCheck = await db.query('SELECT is_active, name FROM utiam_suppliers WHERE id = $1', [supplier_id]);
+  if (supCheck.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
+  if (!supCheck.rows[0].is_active) return reply.status(409).send({ error: 'Impossible de creer un BC pour un fournisseur desactive. Reactivez-le d\'abord.' });
+
+  // Verifier les items
+  for (const item of items) {
+    if (!item.product_id) return reply.status(400).send({ error: 'Chaque article doit avoir un product_id' });
+    if (!item.quantity_ordered || Number(item.quantity_ordered) <= 0) return reply.status(400).send({ error: 'Quantite invalide' });
+  }
+
   const reference = 'BC-' + Date.now();
   const total = items.reduce((s, i) => s + (Number(i.quantity_ordered) * Number(i.unit_price || 0)), 0);
 
@@ -508,7 +527,6 @@ fastify.post('/api/purchase-orders', { onRequest: [fastify.authenticate] }, asyn
     const po = poRes.rows[0];
 
     for (const item of items) {
-      if (!item.product_id || !item.quantity_ordered) continue;
       const prodRes = await client.query('SELECT name FROM utiam_products WHERE id = $1', [item.product_id]);
       const productName = prodRes.rows[0]?.name || 'Produit inconnu';
       const itemTotal = Number(item.quantity_ordered) * Number(item.unit_price || 0);
@@ -550,6 +568,118 @@ fastify.delete('/api/purchase-orders/:id', { onRequest: [fastify.authenticate] }
   }
   await db.query('DELETE FROM utiam_purchase_orders WHERE id = $1', [id]);
   return reply.status(204).send();
+});
+
+// Generation PDF du BC
+fastify.get('/api/purchase-orders/:id/pdf', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+  const { id } = request.params;
+  const poRes = await db.query(`
+    SELECT po.*, s.name as supplier_name, s.phone as supplier_phone, s.email as supplier_email,
+           s.address as supplier_address, s.payment_terms, u.display_name as user_name
+    FROM utiam_purchase_orders po
+    JOIN utiam_suppliers s ON s.id = po.supplier_id
+    JOIN utiam_users u ON u.id = po.user_id
+    WHERE po.id = $1
+  `, [id]);
+  if (poRes.rows.length === 0) return reply.status(404).send({ error: 'BC introuvable' });
+
+  const po = poRes.rows[0];
+  const itemsRes = await db.query(`
+    SELECT poi.*, p.unit FROM utiam_purchase_order_items poi
+    LEFT JOIN utiam_products p ON p.id = poi.product_id
+    WHERE poi.purchase_order_id = $1 ORDER BY poi.id ASC
+  `, [id]);
+  const items = itemsRes.rows;
+
+  // Generation PDF avec PDFKit
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+
+  reply.type('application/pdf');
+  reply.header('Content-Disposition', `inline; filename="${po.reference}.pdf"`);
+
+  doc.pipe(reply.raw);
+
+  const PAYMENT_TERMS = {
+    comptant: 'Comptant',
+    '30j': '30 jours',
+    '60j': '60 jours',
+    '90j': '90 jours',
+  };
+
+  const fmtMoney = (n) => Number(n || 0).toLocaleString('fr-FR') + ' F';
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString('fr-FR') : '—';
+
+  // EN-TETE
+  doc.fontSize(24).fillColor('#d4af37').text('U TIAM', 50, 50);
+  doc.fontSize(10).fillColor('#666').text('KANIENE CONSULT LAB', 50, 78);
+  doc.text('Point de vente — Superette', 50, 92);
+
+  // BON DE COMMANDE titre
+  doc.fontSize(20).fillColor('#000').text('BON DE COMMANDE', 350, 50, { align: 'right', width: 200 });
+  doc.fontSize(12).fillColor('#d4af37').text(po.reference, 350, 78, { align: 'right', width: 200 });
+  doc.fontSize(9).fillColor('#666').text('Date : ' + fmtDate(po.created_at), 350, 96, { align: 'right', width: 200 });
+
+  // Ligne separatrice
+  doc.moveTo(50, 130).lineTo(545, 130).strokeColor('#ddd').stroke();
+
+  // FOURNISSEUR (bloc gauche)
+  doc.fontSize(9).fillColor('#666').text('FOURNISSEUR', 50, 150);
+  doc.fontSize(13).fillColor('#000').text(po.supplier_name, 50, 165);
+  doc.fontSize(10).fillColor('#444');
+  let y = 185;
+  if (po.supplier_phone) { doc.text('Tel : ' + po.supplier_phone, 50, y); y += 14; }
+  if (po.supplier_email) { doc.text('Email : ' + po.supplier_email, 50, y); y += 14; }
+  if (po.supplier_address) { doc.text('Adresse : ' + po.supplier_address, 50, y, { width: 240 }); y += 28; }
+
+  // CONDITIONS (bloc droite)
+  doc.fontSize(9).fillColor('#666').text('CONDITIONS', 350, 150);
+  doc.fontSize(11).fillColor('#000').text('Paiement : ' + (PAYMENT_TERMS[po.payment_terms] || po.payment_terms), 350, 168);
+  if (po.expected_date) doc.text('Livraison prevue : ' + fmtDate(po.expected_date), 350, 184);
+  doc.fontSize(10).fillColor('#444').text('Etabli par : ' + po.user_name, 350, 204);
+
+  // TABLEAU ARTICLES
+  const tableY = 270;
+  doc.fontSize(9).fillColor('#666');
+  doc.text('PRODUIT', 50, tableY);
+  doc.text('QTE', 350, tableY, { width: 50, align: 'right' });
+  doc.text('PRIX UNIT.', 400, tableY, { width: 70, align: 'right' });
+  doc.text('TOTAL', 470, tableY, { width: 75, align: 'right' });
+  doc.moveTo(50, tableY + 14).lineTo(545, tableY + 14).strokeColor('#d4af37').lineWidth(1).stroke();
+
+  let rowY = tableY + 22;
+  doc.fontSize(10).fillColor('#000');
+  for (const item of items) {
+    if (rowY > 720) {
+      doc.addPage();
+      rowY = 50;
+    }
+    doc.text(item.product_name, 50, rowY, { width: 290 });
+    doc.text(String(item.quantity_ordered) + ' ' + (item.unit || ''), 350, rowY, { width: 50, align: 'right' });
+    doc.text(fmtMoney(item.unit_price), 400, rowY, { width: 70, align: 'right' });
+    doc.text(fmtMoney(item.total), 470, rowY, { width: 75, align: 'right' });
+    rowY += 22;
+    doc.moveTo(50, rowY - 6).lineTo(545, rowY - 6).strokeColor('#eee').lineWidth(0.5).stroke();
+  }
+
+  // TOTAL
+  rowY += 10;
+  doc.moveTo(350, rowY).lineTo(545, rowY).strokeColor('#000').lineWidth(1).stroke();
+  rowY += 8;
+  doc.fontSize(11).fillColor('#666').text('TOTAL HT', 350, rowY, { width: 100, align: 'right' });
+  doc.fontSize(14).fillColor('#d4af37').text(fmtMoney(po.total), 450, rowY - 2, { width: 95, align: 'right' });
+
+  // NOTES
+  if (po.notes) {
+    rowY += 50;
+    doc.fontSize(9).fillColor('#666').text('NOTES', 50, rowY);
+    doc.fontSize(10).fillColor('#000').text(po.notes, 50, rowY + 14, { width: 495 });
+  }
+
+  // PIED DE PAGE
+  doc.fontSize(8).fillColor('#999');
+  doc.text('U TIAM — KANIENE CONSULT LAB — Document genere le ' + new Date().toLocaleString('fr-FR'), 50, 780, { width: 495, align: 'center' });
+
+  doc.end();
 });
 
 // ─── PAIEMENTS FOURNISSEURS ──────────────────────────────
@@ -750,6 +880,13 @@ fastify.post('/api/stock/deliveries', { onRequest: [fastify.authenticate] }, asy
   const { items, reason, supplier_id, purchase_order_id } = request.body;
   const user_id = request.user.id;
   if (!Array.isArray(items) || items.length === 0) return reply.status(400).send({ error: 'Aucun produit a receptionner' });
+
+  // Verifier fournisseur si fourni
+  if (supplier_id) {
+    const supCheck = await db.query('SELECT is_active FROM utiam_suppliers WHERE id = $1', [supplier_id]);
+    if (supCheck.rows.length === 0) return reply.status(404).send({ error: 'Fournisseur introuvable' });
+    if (!supCheck.rows[0].is_active) return reply.status(409).send({ error: 'Ce fournisseur est desactive. Reactivez-le avant de l\'utiliser.' });
+  }
 
   const batch_ref = 'BR-' + Date.now();
   let supplierName = null;
